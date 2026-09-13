@@ -296,6 +296,9 @@ in
           systemd.services."halogen-flash-api" = mkRoleUnit "api";
         }
       )
+      # The published API port (the engine port is loopback-only, and
+      # loopback traffic does not traverse the firewall).
+      (lib.mkIf cfg.enable { networking.firewall.allowedTCPPorts = [ cfg.port ]; })
       # Rootless mode support: linger keeps /run/user/<uid> alive for podman,
       # subuid/subgid ranges are REQUIRED by rootless podman (auto-allocation
       # only defaults on for isNormalUser — a system user like ollama needs
