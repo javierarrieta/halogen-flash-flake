@@ -71,12 +71,13 @@ let
       "-v"
       "${cfg.modelsDir}/tokenizer:/tokenizer:ro"
     ]
-    ++ (lib.optionals (cfg.mode == "split") [ "--network=host" ])
-    # In all mode only the API port leaves the container (the engine there
-    # binds loopback INSIDE its own netns). In split mode both containers
-    # share the host netns: the engine keeps its 127.0.0.1 default bind and is
-    # never published, the API reaches it on the same loopback.
-    ++ (lib.optionals ((roleName == "all" || roleName == "api") && cfg.mode != "split") [ "-p" "${toString cfg.port}:8731" ])
+    # All modes run on the host network (upstream's split topology): the
+    # engine binds the host's loopback (HALOGEN_BIND default 127.0.0.1,
+    # never published) and the API binds 0.0.0.0 on the published port.
+    # Host networking also avoids pasta's published-port address selection,
+    # which binds -p forwards only on loopback + the pasta interface — a LAN
+    # client then gets timeouts even with the firewall port open.
+    ++ [ "--network=host" ]
     ++ (lib.optionals (cfg.mode == "split" && roleName == "api") [ "-e" "HALOGEN_ENGINE=127.0.0.1:${toString cfg.enginePort}" ])
     ++ lib.concatMap (k: [ "-e" "${k}=${extraEnv.${k}}" ]) (lib.attrNames extraEnv)
     # raw pass-through, appended last so it can override anything above
