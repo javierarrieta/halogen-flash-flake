@@ -13,8 +13,5 @@
     module = import ./nixos/module.nix;
   in {
     nixosModules.default = module;
-
-    # Convenience alias for `imports` lists.
-    defaultNixosModule = module;
   };
 }
