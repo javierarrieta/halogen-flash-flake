@@ -68,7 +68,15 @@ let
       User = cfg.user;
       # Keep hub tmp/locks next to weights: predictable, per-host, no HOME
       # dependence (root vs service user diverge otherwise).
-      Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
+      Environment =
+        [ "HF_HOME=${cfg.modelsDir}/.cache" ]
+        # Rootless podman needs $HOME (its storage lives under it) and
+        # XDG_RUNTIME_DIR (systemd does not set it for system units with
+        # User=); root runs don't need either.
+        ++ lib.optionals (cfg.user != "root") [
+          "HOME=${cfg.podmanHome}"
+          "XDG_RUNTIME_DIR=/run/user/${toString config.users.users.${cfg.user}.uid}"
+        ];
       ExecStartPre = [ weightsPreCheck ];
       # Generous headroom only while we fetch: the first ever start pulls
       # ~118 GiB of weights.
@@ -91,10 +99,26 @@ in
       default = "root";
       description = ''
         User the systemd units (podman + weights ExecStartPre) run as.
-        Default root: has CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri.
-        For a non-root user, give access to the devices (e.g. video/render
-        groups), read access to modelsDir, and note podman uses that user's
-        storage/network namespace instead of the root system store.
+        Default root: has CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri and uses
+        the system podman store, matching upstream's docker-compose.
+
+        A non-root user means ROOTLESS podman: the container process runs as
+        that uid, and the image lives in that user's podman storage
+        (podmanHome) — it must be pulled BY that user, a root `podman pull`
+        does not help. The user needs render/video group access for /dev/kfd
+        + /dev/dri; the module handles linger, subuid/subgid range
+        allocation and ownership of modelsDir/podmanHome (tmpfiles).
+      '';
+    };
+
+    podmanHome = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/halogen";
+      description = ''
+        $HOME for the unit (only used when user != "root"): holds the user's
+        podman storage (containers/ — image layers, reserve tens of GiB) and
+        stray state files. Put it on a big volume; for a root run it is
+        unused.
       '';
     };
 
@@ -196,9 +220,11 @@ in
     };
   };
 
-  # Runs podman as a system unit under cfg.user (default root): as root the
+  # Runs podman as a system unit as cfg.user (default root; non-root =
+  # rootless podman with the container running as that uid). As root the
   # container process gets CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri;
-  # --group-add keep-groups stays to match upstream's invocation.
+  # --group-add keep-groups stays to match upstream's invocation (and is what
+  # carries render/video GIDs through in rootless mode).
   #
   # GPU memory budget is host-wide: llm01's GTT (~112–120 GiB) is a single
   # pool shared with whatever else the iGPU holds (llama-cpp-server), so this
@@ -217,6 +243,23 @@ in
         lib.mkIf (cfg.enable && cfg.mode == "split") {
           systemd.services."halogen-flash-engine" = mkRoleUnit "engine";
           systemd.services."halogen-flash-api" = mkRoleUnit "api";
+        }
+      )
+      # Rootless mode support: linger keeps /run/user/<uid> alive for podman,
+      # subuid/subgid ranges are REQUIRED by rootless podman (auto-allocation
+      # only defaults on for isNormalUser — a system user like ollama needs
+      # this), and tmpfiles gives the user ownership of its storage and the
+      # weights (Z also fixes ownership of a pre-fetched tree).
+      (
+        lib.mkIf (cfg.enable && cfg.user != "root") {
+          users.users.${cfg.user} = {
+            linger = true;
+            autoSubUidGidRange = true;
+          };
+          systemd.tmpfiles.rules = [
+            "d ${cfg.podmanHome} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+            "Z ${cfg.modelsDir} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+          ];
         }
       )
     ]);
