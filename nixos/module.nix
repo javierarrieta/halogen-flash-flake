@@ -65,6 +65,10 @@ let
       ++ lib.optional (cfg.mode == "split" && roleName == "api") "halogen-flash-engine.service";
     wants = lib.optionals cfg.download.enable [ "network-online.target" ];
     serviceConfig = {
+      User = cfg.user;
+      # Keep hub tmp/locks next to weights: predictable, per-host, no HOME
+      # dependence (root vs service user diverge otherwise).
+      Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
       ExecStartPre = [ weightsPreCheck ];
       # Generous headroom only while we fetch: the first ever start pulls
       # ~118 GiB of weights.
@@ -81,6 +85,18 @@ in
 {
   options.services.halogenFlash = {
     enable = lib.mkEnableOption "halogen-flash-server, the ROCm inference server for Qwen3.8-Flash-Next on AMD Strix Halo";
+
+    user = lib.mkOption {
+      type = lib.types.str;
+      default = "root";
+      description = ''
+        User the systemd units (podman + weights ExecStartPre) run as.
+        Default root: has CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri.
+        For a non-root user, give access to the devices (e.g. video/render
+        groups), read access to modelsDir, and note podman uses that user's
+        storage/network namespace instead of the root system store.
+      '';
+    };
 
     image = lib.mkOption {
       type = lib.types.str;
@@ -180,9 +196,9 @@ in
     };
   };
 
-  # Runs podman as a system unit (root): the container process is root and
-  # gets CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri; --group-add keep-groups
-  # stays to match upstream's invocation.
+  # Runs podman as a system unit under cfg.user (default root): as root the
+  # container process gets CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri;
+  # --group-add keep-groups stays to match upstream's invocation.
   #
   # GPU memory budget is host-wide: llm01's GTT (~112–120 GiB) is a single
   # pool shared with whatever else the iGPU holds (llama-cpp-server), so this

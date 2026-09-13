@@ -43,6 +43,7 @@ Then `nixos-rebuild switch`. The **first start takes hours** (~118 GiB weight tr
 ### Options (`services.halogenFlash.*`)
 
 - `image` — full reference, used as-is (bump + `podman pull` to upgrade).
+- `user` — systemd `User=` for units (default `root`). Non-root needs device access (`video`/`render`), read access to `modelsDir`, uses own podman storage.
 - `port` / `enginePort` — 8731 / 8730.
 - `modelsDir` — where the checkpoint, quality sidecar and `tokenizer/` live.
 - `download.{enable,repo}` — host-side weight fetch before each start (default repo `peonist-ai/halogen-qwen3.8-flash-next`).
