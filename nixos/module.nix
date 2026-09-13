@@ -36,7 +36,9 @@ let
     let
       # Do not mirror shipped defaults here — when the image changes, a stale
       # override silently wins (upstream's own words on their compose file).
-      extraEnv = (lib.optionalAttrs cfg.enableVision { HALOGEN_VISION_TOWER = "1"; })
+      extraEnv = (lib.optionalAttrs cfg.enableVision {
+        HALOGEN_VISION_TOWER = "${cfg.modelsDir}/qwen38-flash-next-vision.hgn";
+      })
       // cfg.environment;
     in
     [
@@ -243,10 +245,12 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Set HALOGEN_VISION_TOWER=1 so images are accepted on /v1 (the vision
-        sidecar lives beside the checkpoint in modelsDir). Off by default: a
-        text-only server is byte-identical to a build without any of it and
-        allocates nothing for it.
+        Set HALOGEN_VISION_TOWER to the vision sidecar inside modelsDir so
+        images are accepted on /v1. The engine wants a PATH (it names the
+        file it found, e.g. /models/qwen38-flash-next-vision.hgn); the
+        sidecar must have been downloaded with the weights. Off by default:
+        a text-only server is byte-identical to a build without any of it
+        and allocates nothing for it.
       '';
     };
 
