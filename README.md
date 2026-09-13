@@ -70,6 +70,19 @@ sudo -u ollama env HOME=<podmanHome> XDG_RUNTIME_DIR=/run/user/<uid> \
 
 The first rootless start also pulls podman's tiny pause/infra image — one outbound fetch, then cached.
 
+If the HuggingFace repo is gated, the weight fetch needs a token: put `HUGGING_FACE_HUB_TOKEN` (or `HF_TOKEN`) in the unit's environment (`systemd.services."halogen-flash".serviceConfig.EnvironmentFile` or an override module).
+
+### Rootless mode — what the module does, and troubleshooting
+
+Setting `user` to a non-root user means rootless podman. The module self-configures everything this needs — **linger**, subuid/subgid range allocation, setuid `newuidmap`/`newgidmap` wrappers, unit `$HOME` (`podmanHome`) + `XDG_RUNTIME_DIR`, and ownership of `modelsDir`/`podmanHome` (tmpfiles) — and runs `virtualisation.podman.package` (which finds the setuid helpers in `/run/wrappers`) instead of plain `pkgs.podman`. You only supply: the user, device-group membership (`video`/`render`), and the image pull (above).
+
+Failure signatures seen in the wild, all fixed in this module but useful to recognize:
+
+- `Failed to obtain podman configuration: lstat /run/user/<uid>: ...` — runtime dir raced the unit; fixed by a tmpfiles rule (needs a switch/reboot to apply).
+- `unknown flag: --name ...` (one merged argument) — systemd splits `ExecStart` itself, no shell; flag/value pairs must be separate argv elements.
+- `setting ulimit ... Operation not permitted` — raising the hard memlock limit needs `LimitMEMLOCK=infinity` on the unit (systemd applies limits as root before switching to `User=`).
+- `newuidmap: executable file not found in $PATH` — rootless runs with a subuid range need the setuid uid-mapping helpers on podman's lookup path.
+
 Caveats:
 
 - **GTT memory is host-wide.** On Strix Halo the iGPU and CPU share one pool (~128 GiB). This server needs ~115 GiB of weights resident, so it is mutually exclusive with anything else living in GTT (e.g. a multi-model `llama-cpp-server` preset) — run one or the other at a time.
