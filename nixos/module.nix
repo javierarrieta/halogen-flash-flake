@@ -17,6 +17,14 @@ let
 
   defaultRepo = "peonist-ai/halogen-qwen3.8-flash-next";
 
+  # Rootless runs need the setuid newuidmap/newgidmap: plain pkgs.podman
+  # bundles crun/passt/etc. next to its binary, but the uid-mapping helpers
+  # must be the system's setuid wrappers. virtualisation.podman.package is
+  # exactly that (it bakes /run/wrappers into the helper lookup — same store
+  # path as the host's own podman when it is enabled, so no rebuild).
+  podmanPkg =
+    if cfg.user != "root" then config.virtualisation.podman.package else pkgs.podman;
+
   weightsPreCheck =
     if cfg.download.enable
     # First start transfers ~118 GiB (resumes when interrupted); later starts
@@ -113,7 +121,7 @@ let
         let
           argv = roleArgs roleName ++ [ cfg.image roleName ];
         in
-        "${pkgs.podman}/bin/podman run ${lib.concatMapStringsSep " " sysdArg argv}";
+        "${podmanPkg}/bin/podman run ${lib.concatMapStringsSep " " sysdArg argv}";
     };
   };
 
@@ -283,6 +291,24 @@ in
           users.users.${cfg.user} = {
             linger = true;
             autoSubUidGidRange = true;
+          };
+          # Rootless podman with a subuid range execs newuidmap/newgidmap,
+          # which only work setuid-root. Define the wrappers here so hosts
+          # without virtualisation.podman (or programs.shadow) get them too;
+          # identical definitions merge cleanly with those modules'.
+          security.wrappers = {
+            newuidmap = {
+              setuid = true;
+              owner = "root";
+              group = "root";
+              source = "${pkgs.shadow}/bin/newuidmap";
+            };
+            newgidmap = {
+              setuid = true;
+              owner = "root";
+              group = "root";
+              source = "${pkgs.shadow}/bin/newgidmap";
+            };
           };
           systemd.tmpfiles.rules = [
             # Guarantee the runtime dir exists before the first start — logind
