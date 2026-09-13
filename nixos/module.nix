@@ -81,6 +81,11 @@ let
       # Generous headroom only while we fetch: the first ever start pulls
       # ~118 GiB of weights.
       TimeoutStartSec = lib.optionalString (cfg.download.enable) "2d";
+      # memlock=-1:-1 (upstream contract) needs to RAISE the hard limit — a
+      # privileged operation. systemd applies this as root before switching
+      # to User=, which is what makes the rootless podman run able to honor
+      # it; without it podman exits immediately with EPERM as non-root.
+      LimitMEMLOCK = "infinity";
       # Weight reloads take minutes; give repeated load failures real room,
       # but keep a crash-loop guard (5 starts in 30 s gives up).
       Restart = "on-failure";
@@ -257,6 +262,9 @@ in
             autoSubUidGidRange = true;
           };
           systemd.tmpfiles.rules = [
+            # Guarantee the runtime dir exists before the first start — logind
+            # creates it for linger, but can race the unit on a fresh switch.
+            "d /run/user/${toString config.users.users.${cfg.user}.uid} 0700 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
             "d ${cfg.podmanHome} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
             "Z ${cfg.modelsDir} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
           ];
