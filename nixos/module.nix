@@ -32,28 +32,43 @@ let
       // cfg.environment;
     in
     [
-      "--name halogen-flash-${roleName}"
+      "--name"
+      "halogen-flash-${roleName}"
       "--rm"
       # Upstream contract — keep in sync with their docker-compose.yml.
-      "--device /dev/kfd"
-      "--device /dev/dri"
-      "--group-add keep-groups"
+      "--device"
+      "/dev/kfd"
+      "--device"
+      "/dev/dri"
+      "--group-add"
+      "keep-groups"
       "--ipc=host"
-      "--ulimit memlock=-1:-1"
+      "--ulimit"
+      "memlock=-1:-1"
       # Holds checkpoint + quality sidecar + tokenizer/; read-only, and every
       # role reads it (the API needs the tokenizer).
-      "-v '${cfg.modelsDir}':/models:ro"
+      "-v"
+      "${cfg.modelsDir}:/models:ro"
     ]
     ++ (lib.optionals (cfg.mode == "split") [ "--network=host" ])
     # In all mode only the API port leaves the container (the engine there
     # binds loopback INSIDE its own netns). In split mode both containers
     # share the host netns: the engine keeps its 127.0.0.1 default bind and is
     # never published, the API reaches it on the same loopback.
-    ++ (lib.optionals ((roleName == "all" || roleName == "api") && cfg.mode != "split") [ "-p ${toString cfg.port}:8731" ])
-    ++ (lib.optionals (cfg.mode == "split" && roleName == "api") [ "-e HALOGEN_ENGINE=127.0.0.1:${toString cfg.enginePort}" ])
-    ++ builtins.map (k: "-e ${k}=${extraEnv.${k}}") (lib.attrNames extraEnv)
+    ++ (lib.optionals ((roleName == "all" || roleName == "api") && cfg.mode != "split") [ "-p" "${toString cfg.port}:8731" ])
+    ++ (lib.optionals (cfg.mode == "split" && roleName == "api") [ "-e" "HALOGEN_ENGINE=127.0.0.1:${toString cfg.enginePort}" ])
+    ++ lib.concatMap (k: [ "-e" "${k}=${extraEnv.${k}}" ]) (lib.attrNames extraEnv)
     # raw pass-through, appended last so it can override anything above
     ++ cfg.extraRunArgs;
+
+  # Quote one argv element for a systemd ExecStart line (systemd splits on
+  # unquoted spaces; inside double quotes it honors \\" and \\, and needs %
+  # doubled to escape specifier expansion). nixpkgs has no ready-made helper
+  # for this, so keep a local one.
+  sysdArg =
+    a:
+    if builtins.match "[A-Za-z0-9_@+=:,./-]*" a != null then a
+    else "\"${lib.replaceStrings [ "\\" "\"" "%" ] [ "\\\\" "\\\"" "%%" ] a}\"";
 
   mkRoleUnit = roleName: {
     description = "halogen-flash-server (${roleName})";
@@ -90,7 +105,15 @@ let
       # but keep a crash-loop guard (5 starts in 30 s gives up).
       Restart = "on-failure";
       RestartSec = "30";
-      ExecStart = "${pkgs.podman}/bin/podman run ${lib.escapeShellArgs (roleArgs roleName)} ${lib.escapeShellArg cfg.image} ${lib.escapeShellArg roleName}";
+      # systemd splits ExecStart itself (no shell): flag/value pairs stay
+      # separate argv elements, each through sysdArg so paths/env values with
+      # spaces survive. (escapeShellArgs was wrong here: it quotes per element
+      # for a shell, producing one-argv "--name foo".)
+      ExecStart =
+        let
+          argv = roleArgs roleName ++ [ cfg.image roleName ];
+        in
+        "${pkgs.podman}/bin/podman run ${lib.concatMapStringsSep " " sysdArg argv}";
     };
   };
 
