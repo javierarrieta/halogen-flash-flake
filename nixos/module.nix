@@ -43,13 +43,18 @@ let
       "--name"
       "halogen-flash-${roleName}"
       "--rm"
-      # Upstream contract — keep in sync with their docker-compose.yml.
+      # Upstream contract — keep in sync with their docker-compose.yml. The
+      # seccomp escape is load-bearing: ROCm's syscall surface (kfd ioctls,
+      # large mappings) trips the default profile, and their README ships it
+      # on every invocation.
       "--device"
       "/dev/kfd"
       "--device"
       "/dev/dri"
       "--group-add"
       "keep-groups"
+      "--security-opt"
+      "seccomp=unconfined"
       "--ipc=host"
       "--ulimit"
       "memlock=-1:-1"
@@ -57,6 +62,12 @@ let
       # role reads it (the API needs the tokenizer).
       "-v"
       "${cfg.modelsDir}:/models:ro"
+      # Upstream's HALOGEN_TOKENIZER default points at /tokenizer — a second
+      # mount in their examples. Ours is the same tree; mount it where the
+      # image expects it (harmless if the image already looks at
+      # /models/tokenizer).
+      "-v"
+      "${cfg.modelsDir}/tokenizer:/tokenizer:ro"
     ]
     ++ (lib.optionals (cfg.mode == "split") [ "--network=host" ])
     # In all mode only the API port leaves the container (the engine there
