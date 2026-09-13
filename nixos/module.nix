@@ -28,7 +28,8 @@ let
     let
       # Do not mirror shipped defaults here — when the image changes, a stale
       # override silently wins (upstream's own words on their compose file).
-      extraEnv = lib.optionalAttrs cfg.enableVision { HALOGEN_VISION_TOWER = "1" } // cfg.environment;
+      extraEnv = (lib.optionalAttrs cfg.enableVision { HALOGEN_VISION_TOWER = "1"; })
+      // cfg.environment;
     in
     [
       "--name halogen-flash-${roleName}"
