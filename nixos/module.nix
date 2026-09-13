@@ -180,21 +180,28 @@ in
     };
   };
 
+  # Runs podman as a system unit (root): the container process is root and
+  # gets CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri; --group-add keep-groups
+  # stays to match upstream's invocation.
+  #
+  # GPU memory budget is host-wide: llm01's GTT (~112–120 GiB) is a single
+  # pool shared with whatever else the iGPU holds (llama-cpp-server), so this
+  # and that are mutually exclusive — run one or the other at a time.
   config =
-    lib.mkIf cfg.enable (lib.mkMerge ([
-      # Runs podman as a system unit (root): the container process is root and
-      # gets CAP_DAC_OVERRIDE for /dev/kfd + /dev/dri; --group-add keep-groups
-      # stays to match upstream's invocation.
-
-      # GPU memory budget is host-wide: llm01's GTT (~112–120 GiB) is a single
-      # pool shared with whatever else the iGPU holds (llama-cpp-server), so
-      # this and that are mutually exclusive — run one or the other at a time.
-
-      lib.mkMerge (lib.mapAttrsToList (_name: unitCfg: { systemd.services.${_name} = unitCfg; }) (
-        if cfg.mode == "all" then { halogen-flash = mkRoleUnit "all"; }
-        else {
-          halogen-flash-engine = mkRoleUnit "engine";
-          halogen-flash-api = mkRoleUnit "api";
-        }))
-    ]));
+    lib.mkMerge ([
+      # Explicit unit names (no mapAttrsToList over dynamic keys): keeps the
+      # merge plain attrsets, which is what the current NixOS module system
+      # handles without trouble.
+      (
+        lib.mkIf (cfg.enable && cfg.mode == "all") {
+          systemd.services."halogen-flash" = mkRoleUnit "all";
+        }
+      )
+      (
+        lib.mkIf (cfg.enable && cfg.mode == "split") {
+          systemd.services."halogen-flash-engine" = mkRoleUnit "engine";
+          systemd.services."halogen-flash-api" = mkRoleUnit "api";
+        }
+      )
+    ]);
 }
