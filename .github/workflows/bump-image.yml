@@ -24,16 +24,28 @@ on:
         description: "Target tag (default: newest published on GHCR)"
         required: false
         type: string
+  # Only the `verify` job listens for this; `bump` is guarded off below.
+  # Without this trigger the verify job can never run at all.
+  pull_request:
+    paths:
+      - 'nixos/module.nix'
+      - '.github/workflows/bump-image.yml'
+      - 'scripts/bump-image.sh'
 
 permissions:
   contents: write
   pull-requests: write
 
+# Event-scoped, so a PR's verify run never queues behind (or collides with)
+# a scheduled bump.
 concurrency:
-  group: bump-halogen-image
+  group: bump-halogen-image-${{ github.event_name }}
 
 jobs:
   bump:
+    # Never on PRs: this job commits and pushes, and a pull_request run has
+    # no usable base to bump from.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
