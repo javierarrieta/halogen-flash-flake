@@ -1,0 +1,139 @@
+# Bump the pinned halogen-flash-server image when upstream publishes one.
+#
+# Why a hand-rolled workflow instead of Dependabot: the "halogen version"
+# here is a string literal in the `image` option default in
+# nixos/module.nix, not a flake input. Dependabot's `nix` ecosystem only
+# rewrites flake.lock (plus pinned input URLs in flake.nix), and its
+# docker/docker-compose ecosystems only parse Dockerfiles, compose files and
+# k8s manifests -- neither of them looks at a .nix file. Renovate's regex
+# manager could do this, but that means installing an app for one dependency.
+#
+# This workflow opens a PR carrying the upstream contract diff. It never
+# merges, pulls, or deploys anything: merging stays the human gate, and the
+# image still has to be `podman pull`ed on the host before a deploy uses it.
+name: Bump halogen-flash-server image
+
+on:
+  schedule:
+    # 05:23 UTC daily. Off the hour on purpose -- GitHub's scheduler is
+    # congested at :00 and dropped runs are not retried.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target tag (default: newest published on GHCR)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: bump-halogen-image
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.bump.outputs.changed }}
+      current: ${{ steps.bump.outputs.current }}
+      new: ${{ steps.bump.outputs.new }}
+      digest: ${{ steps.bump.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the newest upstream tag and patch nixos/module.nix
+        id: bump
+        env:
+          TARGET: ${{ inputs.version }}
+          BODY_FILE: ${{ runner.temp }}/halogen-bump-body.md
+        run: ./scripts/bump-image.sh
+
+      - name: Open the bump PR
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+          NEW: ${{ steps.bump.outputs.new }}
+          BODY_FILE: ${{ runner.temp }}/halogen-bump-body.md
+        run: |
+          set -euo pipefail
+          branch="bump/halogen-image-${NEW}"
+
+          # A daily schedule against a PR nobody has merged yet must not
+          # pile up duplicate branches.
+          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open \
+               --json number | jq -e 'length > 0' > /dev/null; then
+            echo "An open PR for ${branch} already exists; not opening another."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add nixos/module.nix
+          git commit -m "bump: halogen-flash-server ${CURRENT} -> ${NEW}"
+          git push -u origin "$branch"
+
+          gh pr create --base main --head "$branch" \
+            --title "bump: halogen-flash-server ${CURRENT} -> ${NEW}" \
+            --body-file "$BODY_FILE"
+
+      - name: Record the outcome in the run summary
+        if: always()
+        env:
+          OUTCOME: ${{ steps.bump.outcome }}
+          CHANGED: ${{ steps.bump.outputs.changed }}
+          CURRENT: ${{ steps.bump.outputs.current }}
+          NEW: ${{ steps.bump.outputs.new }}
+          DIGEST: ${{ steps.bump.outputs.digest }}
+        run: |
+          {
+            if [ "$OUTCOME" = "failure" ]; then
+              echo "Bump failed -- see the log above."
+            elif [ "$CHANGED" = "true" ]; then
+              echo "Patched \`nixos/module.nix\`: \`${CURRENT}\` -> \`${NEW}\`, PR opened."
+            else
+              echo "Already pinned to the newest upstream tag (\`${CURRENT}\`); nothing to do."
+            fi
+            if [ -n "$DIGEST" ]; then
+              echo
+              echo "Digest of \`${NEW}\`: \`$DIGEST\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs on the PR the job above opens, and on any hand-edited module, so a
+  # green check means the module still evaluates with the new tag. This is
+  # an evaluation gate only -- it cannot prove the new image runs, because
+  # nothing here pulls it.
+  verify:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Evaluate the module against its pinned nixpkgs
+        run: |
+          set -euo pipefail
+          image="$(nix eval --impure --raw --expr '
+            let
+              self = builtins.getFlake (toString ./.);
+              pkgs = import self.inputs.nixpkgs { localSystem = "x86_64-linux"; };
+              eval = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+                system = "x86_64-linux";
+                modules = [ ./nixos/module.nix ];
+              };
+            in eval.config.services.halogenFlash.image
+          ')"
+          echo "module evaluates; image = ${image}"
+          # Catch a bump that landed on the wrong literal.
+          if ! grep -qF "\"${image}\"" nixos/module.nix; then
+            echo "::error::evaluated image does not appear literally in nixos/module.nix" >&2
+            exit 1
+          fi
+
+      - name: Flake check
+        run: nix flake check --no-build
