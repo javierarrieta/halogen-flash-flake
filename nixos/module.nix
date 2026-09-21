@@ -17,6 +17,15 @@ let
 
   defaultRepo = "peonist-ai/halogen-qwen3.8-flash-next";
 
+  # The weights are pinned here, next to the image pin below, because they are
+  # a matched pair: this server version is only known-good with this model
+  # version. flake.lock freezes this source tree, so the string is transitively
+  # pinned exactly like the image digest is -- neither artifact's bytes live in
+  # the Nix store, the lock freezes the text that names them. Bump deliberately:
+  # a new revision makes the next start fetch ~118 GiB (see the health-gate
+  # warmup window downstream). scripts/bump-image.sh reports the upstream sha.
+  defaultWeightsRevision = "cd24312f5c5e671659f538ed1f489120c658901f";
+
   # Rootless runs need the setuid newuidmap/newgidmap: plain pkgs.podman
   # bundles crun/passt/etc. next to its binary, but the uid-mapping helpers
   # must be the system's setuid wrappers. virtualisation.podman.package is
@@ -327,20 +336,19 @@ in
         };
         options.revision = lib.mkOption {
           type = lib.types.str;
-          default = "";
+          default = defaultWeightsRevision;
           example = "cd24312f5c5e671659f538ed1f489120c658901f";
           description = ''
-            HuggingFace commit sha to pin the weights to. Empty means the
-            repo's default branch, which floats: an upstream push would swap
-            the model underneath a digest-pinned image with no review and no
-            rollback path, and may not even match what that image expects.
-            Set a sha to make the weights as immutable as the image.
-            `scripts/bump-image.sh` reports the current upstream sha so a
-            weights change can become a reviewed commit too.
+            HuggingFace commit sha to pin the weights to. Defaults to
+            `defaultWeightsRevision` above so the weights are as immutable as
+            the image. Setting it to "" means the repo's default branch,
+            which floats: an upstream push would swap the model underneath a
+            digest-pinned image with no review and no rollback path, and may
+            not even match what that image expects.
           '';
         };
       });
-      default = { enable = false; repo = defaultRepo; revision = ""; };
+      default = { enable = false; repo = defaultRepo; revision = defaultWeightsRevision; };
       description = ''
         When enabled, ExecStartPre runs `hf download <repo> [--revision <rev>]
         --local-dir modelsDir` on every start: the first time it transfers
