@@ -191,6 +191,16 @@ PY
 out changed "true"
 
 # --- 6. PR body -------------------------------------------------------------
+# The weights live in a separate HuggingFace repo and float on its default
+# branch unless the deployment pins download.revision. Report where upstream
+# is so a weights move shows up in this PR instead of arriving silently on
+# the next service start.
+WEIGHTS_REPO="${WEIGHTS_REPO:-peonist-ai/halogen-qwen3.8-flash-next}"
+hf_json="$(curl -fsSL --retry 2 "https://huggingface.co/api/models/${WEIGHTS_REPO}" 2>/dev/null || true)"
+hf_sha="$(printf '%s' "${hf_json}" | jq -r '.sha // empty' 2>/dev/null || true)"
+hf_modified="$(printf '%s' "${hf_json}" | jq -r '.lastModified // empty' 2>/dev/null || true)"
+out hf_sha "${hf_sha}"
+
 {
   echo "## ${IMAGE}"
   echo
@@ -209,6 +219,19 @@ out changed "true"
     echo "> **Digest unavailable** (registry fetch failed): the new pin is tag-only."
     echo "> That is not safe with \`pull.enable\` -- the module warns about it."
     echo "> Re-run once the registry is reachable to get a pinned reference."
+  fi
+  echo
+  echo "### Weights (separate repo — this PR does not change them)"
+  echo
+  if [ -n "${hf_sha}" ]; then
+    echo "Upstream \`${WEIGHTS_REPO}\` is at \`${hf_sha}\` (${hf_modified:-unknown})."
+    echo
+    echo "The image above is digest-pinned; the weights are only as reproducible as"
+    echo "the deployment's \`services.halogenFlash.download.revision\`. Changing that"
+    echo "sha is a **deliberate, separate** change: the next service start fetches"
+    echo "~118 GiB, so the health-gate warmup window has to outlast it."
+  else
+    echo "Could not read \`${WEIGHTS_REPO}\` from the HuggingFace API."
   fi
   echo
   echo "Opened automatically by \`.github/workflows/bump-image.yml\`. **Nothing was"

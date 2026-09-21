@@ -28,8 +28,14 @@ let
   weightsPreCheck =
     if cfg.download.enable
     # First start transfers ~118 GiB (resumes when interrupted); later starts
-    # re-verify existing files and only fetch what changed.
-    then "${pkgs.python3Packages.huggingface-hub}/bin/hf download ${cfg.download.repo} --local-dir '${cfg.modelsDir}'"
+    # re-verify existing files and only fetch what changed. With `revision`
+    # set, hf fetches that exact commit instead of the floating default branch.
+    then
+      let
+        revArg = lib.optionalString (cfg.download.revision != "")
+          " --revision '${cfg.download.revision}'";
+      in
+      "${pkgs.python3Packages.huggingface-hub}/bin/hf download ${cfg.download.repo}${revArg} --local-dir '${cfg.modelsDir}'"
     else "test -d '${cfg.modelsDir}'";
 
   roleArgs = roleName:
@@ -319,13 +325,33 @@ in
           default = defaultRepo;
           description = "HuggingFace repo id: ~115 GiB checkpoint, quality sidecar and tokenizer.";
         };
+        options.revision = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "cd24312f5c5e671659f538ed1f489120c658901f";
+          description = ''
+            HuggingFace commit sha to pin the weights to. Empty means the
+            repo's default branch, which floats: an upstream push would swap
+            the model underneath a digest-pinned image with no review and no
+            rollback path, and may not even match what that image expects.
+            Set a sha to make the weights as immutable as the image.
+            `scripts/bump-image.sh` reports the current upstream sha so a
+            weights change can become a reviewed commit too.
+          '';
+        };
       });
-      default = { enable = false; repo = defaultRepo; };
+      default = { enable = false; repo = defaultRepo; revision = ""; };
       description = ''
-        When enabled, ExecStartPre runs `hf download <repo> --local-dir
-        modelsDir` on every start: the first time it transfers ~118 GiB (it
-        resumes when interrupted), afterwards hf-hub re-verifies existing files
-        and only fetches what changed. The container therefore never dials out.
+        When enabled, ExecStartPre runs `hf download <repo> [--revision <rev>]
+        --local-dir modelsDir` on every start: the first time it transfers
+        ~118 GiB (it resumes when interrupted), afterwards hf-hub re-verifies
+        existing files and only fetches what changed. The container therefore
+        never dials out.
+
+        Note this makes service start depend on the transfer: a pinned revision
+        change is a fresh ~118 GiB fetch, so the deploy that introduces one
+        needs a health-gate warmup window that can outlast it (see
+        cominGitOps.healthGate.halogenWarmupSec downstream).
 
         When disabled, provision the directory yourself (`hf download ...
         --local-dir <modelsDir>` by hand) — a plain `test -d` runs instead.
