@@ -11,7 +11,12 @@
 # This workflow opens a PR carrying the upstream contract diff. It never
 # merges, pulls, or deploys anything: merging stays the human gate, and the
 # image still has to be `podman pull`ed on the host before a deploy uses it.
-name: Bump halogen-flash-server image
+#
+# It tracks TWO artifacts independently: the image tag/digest, and
+# `defaultWeightsRevision` (the HuggingFace checkpoint). They move on
+# different schedules, so a weights-only release opens a PR too rather
+# than going unnoticed until the next image bump.
+name: Bump halogen-flash-server image and weights
 
 on:
   schedule:
@@ -49,9 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
+      image_changed: ${{ steps.bump.outputs.image_changed }}
+      weights_changed: ${{ steps.bump.outputs.weights_changed }}
       current: ${{ steps.bump.outputs.current }}
       new: ${{ steps.bump.outputs.new }}
       digest: ${{ steps.bump.outputs.digest }}
+      current_weights: ${{ steps.bump.outputs.current_weights }}
+      new_weights: ${{ steps.bump.outputs.new_weights }}
+      weights_probe: ${{ steps.bump.outputs.weights_probe }}
     steps:
       - uses: actions/checkout@v4
 
@@ -66,30 +76,30 @@ jobs:
         if: steps.bump.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          CURRENT: ${{ steps.bump.outputs.current }}
-          NEW: ${{ steps.bump.outputs.new }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          PR_TITLE: ${{ steps.bump.outputs.pr_title }}
           BODY_FILE: ${{ runner.temp }}/halogen-bump-body.md
         run: |
           set -euo pipefail
-          branch="bump/halogen-image-${NEW}"
 
           # A daily schedule against a PR nobody has merged yet must not
-          # pile up duplicate branches.
-          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open \
+          # pile up duplicate branches. The branch name comes from the
+          # script, so an image bump and a weights bump do not collide.
+          if gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --state open \
                --json number | jq -e 'length > 0' > /dev/null; then
-            echo "An open PR for ${branch} already exists; not opening another."
+            echo "An open PR for ${BRANCH} already exists; not opening another."
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$branch"
+          git checkout -b "$BRANCH"
           git add nixos/module.nix
-          git commit -m "bump: halogen-flash-server ${CURRENT} -> ${NEW}"
-          git push -u origin "$branch"
+          git commit -m "$PR_TITLE"
+          git push -u origin "$BRANCH"
 
-          gh pr create --base main --head "$branch" \
-            --title "bump: halogen-flash-server ${CURRENT} -> ${NEW}" \
+          gh pr create --base main --head "$BRANCH" \
+            --title "$PR_TITLE" \
             --body-file "$BODY_FILE"
 
       - name: Record the outcome in the run summary
@@ -97,17 +107,38 @@ jobs:
         env:
           OUTCOME: ${{ steps.bump.outcome }}
           CHANGED: ${{ steps.bump.outputs.changed }}
+          IMAGE_CHANGED: ${{ steps.bump.outputs.image_changed }}
+          WEIGHTS_CHANGED: ${{ steps.bump.outputs.weights_changed }}
           CURRENT: ${{ steps.bump.outputs.current }}
           NEW: ${{ steps.bump.outputs.new }}
           DIGEST: ${{ steps.bump.outputs.digest }}
+          CURRENT_WEIGHTS: ${{ steps.bump.outputs.current_weights }}
+          NEW_WEIGHTS: ${{ steps.bump.outputs.new_weights }}
+          WEIGHTS_PROBE: ${{ steps.bump.outputs.weights_probe }}
         run: |
           {
             if [ "$OUTCOME" = "failure" ]; then
               echo "Bump failed -- see the log above."
-            elif [ "$CHANGED" = "true" ]; then
-              echo "Patched \`nixos/module.nix\`: \`${CURRENT}\` -> \`${NEW}\`, PR opened."
+            elif [ "$CHANGED" != "true" ]; then
+              echo "Nothing to do: image \`${CURRENT}\` current."
+              if [ "$WEIGHTS_PROBE" = "failed" ]; then
+                echo "Weights **not verified** this run (HuggingFace API unreachable)."
+              else
+                echo "Weights \`${CURRENT_WEIGHTS:-unpinned}\` current."
+              fi
             else
-              echo "Already pinned to the newest upstream tag (\`${CURRENT}\`); nothing to do."
+              echo "Patched \`nixos/module.nix\`; PR opened."
+              echo
+              if [ "$IMAGE_CHANGED" = "true" ]; then
+                echo "- image: \`${CURRENT}\` -> \`${NEW}\`"
+              else
+                echo "- image: unchanged (\`${CURRENT}\`)"
+              fi
+              if [ "$WEIGHTS_CHANGED" = "true" ]; then
+                echo "- weights: \`${CURRENT_WEIGHTS:-unpinned}\` -> \`${NEW_WEIGHTS}\`"
+              else
+                echo "- weights: unchanged"
+              fi
             fi
             if [ -n "$DIGEST" ]; then
               echo
