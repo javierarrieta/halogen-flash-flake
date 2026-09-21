@@ -77,17 +77,24 @@ fi
 
 # --- 2. current pin ---------------------------------------------------------
 # Python rather than grep/sed: the image reference is a literal we must match
-# exactly, and re.escape() beats hand-rolled BRE escaping.
-cur="$(python3 - "${MODULE}" "${IMAGE}" <<'PY'
+# exactly, and re.escape() beats hand-rolled BRE escaping. The existing pin
+# may or may not carry a digest; capture both so a tag that moved upstream is
+# detectable rather than silently ignored.
+read -r cur cur_digest < <(python3 - "${MODULE}" "${IMAGE}" <<'PY'
 import re, sys
 
 path, image = sys.argv[1], sys.argv[2]
 with open(path, encoding="utf-8") as fh:
     text = fh.read()
-match = re.search(re.escape(image) + r':(\d+\.\d+\.\d+)"', text)
-print(match.group(1) if match else "", end="")
+match = re.search(
+    re.escape(image) + r':(\d+\.\d+\.\d+)(?:@(sha256:[0-9a-f]{64}))?"', text
+)
+if match:
+    print(match.group(1), match.group(2) or "")
+else:
+    print("")
 PY
-)"
+)
 
 if [ -z "${cur}" ]; then
   echo "::error::could not find a pinned ${IMAGE}:<version> in ${MODULE}" >&2
@@ -95,23 +102,34 @@ if [ -z "${cur}" ]; then
 fi
 
 out current "${cur}"
+out current_digest "${cur_digest}"
 out new "${new}"
-
-if [ "${cur}" = "${new}" ]; then
-  echo "${IMAGE} is already pinned to the newest upstream tag (${cur})."
-  out changed "false"
-  out digest ""
-  exit 0
-fi
 
 # --- 3. digest (best effort) ------------------------------------------------
 # The release is an OCI image manifest; GHCR 404s unless the Accept header
-# names that media type explicitly.
+# names that media type explicitly. Fetched BEFORE the up-to-date check: the
+# comparison below reads it, and `set -u` would abort on an unset variable.
 digest="$(curl -fsSL --retry 3 -o /dev/null -w '%header{docker-content-digest}' \
   -H "Authorization: Bearer ${pull_token}" \
   -H "Accept: application/vnd.oci.image.manifest.v1+json" \
   "https://ghcr.io/v2/${GHCR_PATH}/manifests/${new}" 2>/dev/null || true)"
 out digest "${digest}"
+
+# A tag that moved under us is a change worth a PR even when the version
+# string is unchanged -- it means the reviewed artifact and the registry's
+# current one are different bytes.
+if [ "${cur}" = "${new}" ] && { [ -z "${digest}" ] || [ "${cur_digest}" = "${digest}" ]; }; then
+  echo "${IMAGE} is already pinned to the newest upstream tag (${cur})."
+  out changed "false"
+  exit 0
+fi
+
+if [ "${cur}" = "${new}" ]; then
+  reason="tag-moved"
+else
+  reason="bump"
+fi
+out reason "${reason}"
 
 # --- 4. upstream contract diff ----------------------------------------------
 # GitHub's compare API gives per-file patches without a clone. The git tags are
@@ -149,20 +167,25 @@ changelog="$(curl -fsSL --retry 3 \
   ' | head_n 200 || true)"
 
 # --- 5. patch the module ----------------------------------------------------
-python3 - "${MODULE}" "${IMAGE}:${cur}" "${IMAGE}:${new}" <<'PY'
-import sys
+# Rewrite the whole reference (version and any existing digest) so the pin
+# never ends up with a stale digest glued onto a new tag.
+python3 - "${MODULE}" "${IMAGE}" "${new}" "${digest}" <<'PY'
+import re, sys
 
-path, old, new = sys.argv[1:4]
+path, image, new, digest = sys.argv[1:5]
+pattern = re.escape(image) + r':\d+\.\d+\.\d+(?:@sha256:[0-9a-f]{64})?'
+replacement = f"{image}:{new}" + (f"@{digest}" if digest else "")
+
 with open(path, encoding="utf-8") as fh:
     text = fh.read()
 
-count = text.count(old)
+new_text, count = re.subn(pattern, replacement, text)
 if count == 0:
-    sys.exit(f"literal {old!r} not found in {path}; refusing to patch")
+    sys.exit(f"no pinned reference for {image!r} found in {path}; refusing to patch")
 
 with open(path, "w", encoding="utf-8") as fh:
-    fh.write(text.replace(old, new))
-print(f"patched {count} occurrence(s) of {old} -> {new}")
+    fh.write(new_text)
+print(f"patched {count} occurrence(s) -> {replacement}")
 PY
 
 out changed "true"
@@ -173,15 +196,26 @@ out changed "true"
   echo
   echo "| | |"
   echo "|---|---|"
-  echo "| Pinned | \`${IMAGE}:${cur}\` |"
-  echo "| Newest upstream | \`${IMAGE}:${new}\` |"
-  if [ -n "${digest}" ]; then
-    echo "| Digest (\`${new}\`) | \`${digest}\` |"
+  echo "| Was pinned | \`${IMAGE}:${cur}${cur_digest:+@${cur_digest}}\` |"
+  echo "| Now pinned | \`${IMAGE}:${new}${digest:+@${digest}}\` |"
+  if [ "${reason}" = "tag-moved" ]; then
+    echo
+    echo "> **Upstream moved the \`${new}\` tag** -- same version string, different"
+    echo "> bytes. Whatever is running was built from the old manifest, so this"
+    echo "> diff is not the one that produced the current deployment."
+  fi
+  if [ -z "${digest}" ]; then
+    echo
+    echo "> **Digest unavailable** (registry fetch failed): the new pin is tag-only."
+    echo "> That is not safe with \`pull.enable\` -- the module warns about it."
+    echo "> Re-run once the registry is reachable to get a pinned reference."
   fi
   echo
   echo "Opened automatically by \`.github/workflows/bump-image.yml\`. **Nothing was"
-  echo "pulled, deployed, or restarted** -- the module never pulls the image, and"
-  echo "merging this does not touch llm01 until the next deploy *and* a pull."
+  echo "pulled, deployed, or restarted by this PR.** With \`pull.enable\` off (the"
+  echo "default) the image has to be pulled by hand before the next deploy; with"
+  echo "\`pull.enable\` on, the host pulls the pinned digest itself at service"
+  echo "start, so merging is what changes the running version on the next deploy."
   echo
   echo "### Review before merging"
   echo
@@ -196,8 +230,8 @@ out changed "true"
   echo "- [ ] Env var names/semantics unchanged (\`docs/FLAGS.md\` diff)"
   echo "- [ ] Engine and API still run the **same** tag (upstream issue #26:"
   echo "      version skew silently mis-routes vision requests)"
-  echo "- [ ] Pulled on llm01 before deploy:"
-  echo "      \`sudo -u ollama HOME=/opt/llm/halogen XDG_RUNTIME_DIR=/run/user/27002 podman pull ${IMAGE}:${new}\`"
+  echo "- [ ] Pulled on llm01 before deploy (skip if \`pull.enable\` is set):"
+  echo "      \`sudo -u ollama HOME=/opt/llm/halogen XDG_RUNTIME_DIR=/run/user/27002 podman pull ${IMAGE}:${new}${digest:+@${digest}}\`"
   echo "- [ ] GTT budget still fits: a restart reloads ~115 GiB, and the health"
   echo "      gate rolls the deploy back if \`/health\` misses warmup"
   if [ -n "${compose_patch}" ]; then

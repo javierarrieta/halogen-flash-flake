@@ -92,28 +92,86 @@ let
     if builtins.match "[A-Za-z0-9_@+=:,./-]*" a != null then a
     else "\"${lib.replaceStrings [ "\\" "\"" "%" ] [ "\\\\" "\\\"" "%%" ] a}\"";
 
+  # A digest-pinned reference (name:tag@sha256:...) names immutable bytes;
+  # a bare tag does not. Split the two so the pull unit can verify local
+  # presence against the digest instead of trusting a tag that may have
+  # moved since it was reviewed.
+  imageParts =
+    let
+      parts = builtins.match "(.*)@(sha256:[0-9a-f]{64})" cfg.image;
+    in
+    if parts != null then
+      { ref = builtins.elemAt parts 0; digest = builtins.elemAt parts 1; }
+    else
+      { ref = cfg.image; digest = ""; };
+
+  # Shared by the role units and the pull unit. Rootless podman needs $HOME
+  # (its storage lives under it) and XDG_RUNTIME_DIR (systemd sets neither
+  # for system units with User=); root runs need neither.
+  unitEnvironment =
+    [ "HF_HOME=${cfg.modelsDir}/.cache" ]
+    ++ lib.optionals (cfg.user != "root") [
+      "HOME=${cfg.podmanHome}"
+      "XDG_RUNTIME_DIR=/run/user/${toString config.users.users.${cfg.user}.uid}"
+    ];
+
+  # Pull the pinned image, but never let a dead registry take the server
+  # down. If the pull fails and the exact artifact is already in local
+  # storage, those are the same bytes we would have pulled, so succeed
+  # anyway. With a digest-pinned `image` that equivalence is provable; with
+  # a bare tag it is a guess, which is what the `pull` warning is about.
+  #
+  # Retries live here rather than in systemd Restart=, which is not
+  # meaningful for a Type=oneshot unit.
+  pullScript = ''
+    set -u
+    podman="${podmanPkg}/bin/podman"
+    attempts=3
+    n=1
+
+    while [ "$n" -le "$attempts" ]; do
+      if "$podman" pull --quiet "$HALOGEN_IMAGE"; then
+        echo "halogen-flash: pulled $HALOGEN_IMAGE"
+        exit 0
+      fi
+      echo "halogen-flash: pull attempt $n/$attempts failed for $HALOGEN_IMAGE" >&2
+      n=$((n + 1))
+      if [ "$n" -le "$attempts" ]; then sleep 15; fi
+    done
+
+    if [ -n "$HALOGEN_DIGEST" ]; then
+      if "$podman" images --no-trunc --format '{{.Id}}' | grep -qxF "$HALOGEN_DIGEST"; then
+        echo "halogen-flash: pull failed, pinned digest already in local storage"
+        exit 0
+      fi
+    elif "$podman" image exists "$HALOGEN_IMAGE"; then
+      echo "halogen-flash: pull failed, tag already in local storage (mutable tag: not necessarily current)" >&2
+      exit 0
+    fi
+
+    echo "halogen-flash: pull failed and $HALOGEN_IMAGE is not available locally" >&2
+    exit 1
+  '';
+
   mkRoleUnit = roleName: {
     description = "halogen-flash-server (${roleName})";
     wantedBy = [ "multi-user.target" ];
     after =
-      (lib.optionals cfg.download.enable [ "network-online.target" ])
+      # The pull unit is a hard dependency: no image, no server. It exits 0
+      # when the pinned artifact is already local, so this does not make
+      # boot contingent on the registry being reachable.
+      (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ])
+      ++ (lib.optionals cfg.download.enable [ "network-online.target" ])
       # split mode: don't race the engine to boot; its weight load takes
       # minutes and an API that starts first crash-loops until it is ready.
       ++ lib.optional (cfg.mode == "split" && roleName == "api") "halogen-flash-engine.service";
-    wants = lib.optionals cfg.download.enable [ "network-online.target" ];
+    wants = lib.optionals (cfg.download.enable || cfg.pull.enable) [ "network-online.target" ];
+    requires = lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ];
     serviceConfig = {
       User = cfg.user;
       # Keep hub tmp/locks next to weights: predictable, per-host, no HOME
       # dependence (root vs service user diverge otherwise).
-      Environment =
-        [ "HF_HOME=${cfg.modelsDir}/.cache" ]
-        # Rootless podman needs $HOME (its storage lives under it) and
-        # XDG_RUNTIME_DIR (systemd does not set it for system units with
-        # User=); root runs don't need either.
-        ++ lib.optionals (cfg.user != "root") [
-          "HOME=${cfg.podmanHome}"
-          "XDG_RUNTIME_DIR=/run/user/${toString config.users.users.${cfg.user}.uid}"
-        ];
+      Environment = unitEnvironment;
       ExecStartPre = [ weightsPreCheck ];
       # Generous headroom only while we fetch: the first ever start pulls
       # ~118 GiB of weights.
@@ -174,14 +232,45 @@ in
 
     image = lib.mkOption {
       type = lib.types.str;
-      default = "ghcr.io/peonist-ai/halogen-flash-server:0.12.3";
+      default = "ghcr.io/peonist-ai/halogen-flash-server:0.12.3@sha256:0a49060de34eba6ab762196d4f109a5dab476e10a21841e641c0194346dd5c7d";
       description = ''
         Full container-image reference for the release build. Both units in
-        split mode run this one tag on purpose: an API older than the engine
-        silently mis-routes requests (upstream issue #26).
+        split mode run this one reference on purpose: an API older than the
+        engine silently mis-routes requests (upstream issue #26).
 
-        The image is used as-is and never pulled automatically; bump this
-        option to a new release, `podman pull` it, then restart the units.
+        Prefer the digest-pinned form `name:tag@sha256:<digest>`. It is
+        what makes `pull.enable` safe: the running container is then
+        provably the artifact that was reviewed, and the pull unit's
+        offline fallback ("already in local storage") means the same bytes
+        rather than whatever a mutable tag last pointed at. The bump script
+        in this repo writes the pinned form for you.
+
+        Without `pull.enable`, the image is used as-is and never fetched:
+        bump this option, `podman pull` it as `user`, then restart.
+      '';
+    };
+
+    pull = lib.mkOption {
+      type = lib.types.submodule {
+        options.enable = lib.mkEnableOption ''
+          a oneshot unit that pulls the image before the server units start
+        '';
+      };
+      default = { enable = false; };
+      description = ''
+        When enabled, `halogen-flash-pull.service` runs before the role
+        units and pulls `image` as `user` — which matters for rootless
+        setups, where a root `podman pull` would land in the wrong store.
+
+        The unit retries three times, and still succeeds if the pull fails
+        while the exact artifact is already in local storage, so a reboot
+        during a registry outage keeps the server up. If the artifact is
+        neither pullable nor present, the unit fails and the role units do
+        not start (they `Requires=` it) — a loud failure the host health
+        gate sees, rather than a silently stale container.
+
+        Only enable this with a digest-pinned `image`; the module warns
+        otherwise.
       '';
     };
 
@@ -292,14 +381,55 @@ in
         }
       )
       (
+        lib.mkIf (cfg.enable && cfg.pull.enable) {
+          systemd.services."halogen-flash-pull" = {
+            description = "Pull the halogen-flash-server image";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network-online.target" ];
+            wants = [ "network-online.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              # Same user as the role units: rootless podman stores the image
+              # per-user, so pulling as anyone else is useless here.
+              User = cfg.user;
+              Environment = unitEnvironment ++ [
+                "HALOGEN_IMAGE=${cfg.image}"
+                "HALOGEN_DIGEST=${imageParts.digest}"
+              ];
+              ExecStart = "${pkgs.bash}/bin/bash -c ${sysdArg pullScript}";
+              # The image is the engine + front-end only (a few GiB); the
+              # ~118 GiB of weights are a separate volume and untouched
+              # here. Generous, but bounded well below the weight-fetch
+              # timeout on the role units.
+              TimeoutStartSec = "30min";
+            };
+          };
+        }
+      )
+      (
         lib.mkIf (cfg.enable && cfg.mode == "split") {
           systemd.services."halogen-flash-engine" = mkRoleUnit "engine";
           systemd.services."halogen-flash-api" = mkRoleUnit "api";
         }
       )
+      (
+        lib.mkIf (cfg.enable && cfg.pull.enable && imageParts.digest == "") {
+          warnings = [
+            ''
+              services.halogenFlash.pull is enabled but services.halogenFlash.image
+              (${cfg.image}) is not digest-pinned. The pull unit fetches a mutable
+              tag, so the container that starts is whatever the registry served at
+              that moment — not necessarily the release that was reviewed — and the
+              "already in local storage" fallback is a guess rather than a proof.
+              Pin it as `name:tag@sha256:<digest>` (scripts/bump-image.sh writes
+              this form) or disable the pull.''
+          ];
+        }
+      )
       # The published API port (the engine port is loopback-only, and
       # loopback traffic does not traverse the firewall).
-      (lib.mkIf cfg.enable { networking.firewall.allowedTCPPorts = [ cfg.port ]; })
+      (lib.mkIf cfg.enable { networking.firewall.allowedTCPPorts = [ cfg.port]; })
       # Rootless mode support: linger keeps /run/user/<uid> alive for podman,
       # subuid/subgid ranges are REQUIRED by rootless podman (auto-allocation
       # only defaults on for isNormalUser — a system user like ollama needs
