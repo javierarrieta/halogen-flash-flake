@@ -174,8 +174,9 @@ let
       Environment = unitEnvironment;
       ExecStartPre = [ weightsPreCheck ];
       # Generous headroom only while we fetch: the first ever start pulls
-      # ~118 GiB of weights.
-      TimeoutStartSec = lib.optionalString (cfg.download.enable) "2d";
+      # ~118 GiB of weights. (mkIf rather than optionalString: an empty
+      # TimeoutStartSec= is a parse failure systemd only warns about.)
+      TimeoutStartSec = lib.mkIf cfg.download.enable "2d";
       # memlock=-1:-1 (upstream contract) needs to RAISE the hard limit — a
       # privileged operation. systemd applies this as root before switching
       # to User=, which is what makes the rootless podman run able to honor
@@ -397,7 +398,7 @@ in
                 "HALOGEN_IMAGE=${cfg.image}"
                 "HALOGEN_DIGEST=${imageParts.digest}"
               ];
-              ExecStart = "${pkgs.bash}/bin/bash -c ${sysdArg pullScript}";
+              ExecStart = "${pkgs.writeShellScript "halogen-flash-pull" pullScript}";
               # The image is the engine + front-end only (a few GiB); the
               # ~118 GiB of weights are a separate volume and untouched
               # here. Generous, but bounded well below the weight-fetch

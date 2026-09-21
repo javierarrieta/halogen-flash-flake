@@ -136,7 +136,14 @@ jobs:
               pkgs = import self.inputs.nixpkgs { localSystem = "x86_64-linux"; };
               eval = import (pkgs.path + "/nixos/lib/eval-config.nix") {
                 system = "x86_64-linux";
-                modules = [ ./nixos/module.nix ];
+                modules = [
+                  ./nixos/module.nix
+                  # pull on, so the pull unit is generated and gets verified
+                  # below -- it does not exist in the default config, which
+                  # is exactly how a broken unit escaped this job before.
+                  { services.halogenFlash.enable = true;
+                    services.halogenFlash.pull.enable = true; }
+                ];
               };
             in eval.config.services.halogenFlash.image
           ')"
@@ -144,6 +151,57 @@ jobs:
           # Catch a bump that landed on the wrong literal.
           if ! grep -qF "\"${image}\"" nixos/module.nix; then
             echo "::error::evaluated image does not appear literally in nixos/module.nix" >&2
+            exit 1
+          fi
+
+      - name: Verify the generated unit files (systemd-analyze)
+        # Evaluation proves the Nix is well-formed; it does NOT prove the
+        # generated unit files are. A multi-line ExecStart rendered fine as
+        # an attrset and systemd refused the whole unit at load time. This
+        # verifies every halogen-flash unit for both modes as systemd will.
+        run: |
+          set -euo pipefail
+          render () {
+            nix eval --impure --raw --expr "
+              let
+                self = builtins.getFlake (toString ./.);
+                pkgs = import self.inputs.nixpkgs { localSystem = \"x86_64-linux\"; };
+                lib = pkgs.lib;
+                eval = import (pkgs.path + \"/nixos/lib/eval-config.nix\") {
+                  system = \"x86_64-linux\";
+                  modules = [
+                    ./nixos/module.nix
+                    { services.halogenFlash.enable = true;
+                      services.halogenFlash.pull.enable = true;
+                      services.halogenFlash.mode = \"$1\"; }
+                  ];
+                };
+                units = lib.filterAttrs
+                  (n: _: lib.hasPrefix \"halogen-flash\" n)
+                  eval.config.systemd.units;
+              in builtins.toJSON (lib.mapAttrs (_: u: u.text) units)
+            "
+          }
+          mkdir -p verified-units
+          for mode in all split; do
+            render "$mode" > "units-$mode.json"
+            for unit in $(jq -r 'keys[]' "units-$mode.json"); do
+              jq -r --arg u "$unit" '.[$u]' "units-$mode.json" \
+                > "verified-units/$unit"
+            done
+          done
+          ls verified-units
+          # Exit status is not usable: verify also fails on environmental
+          # noise (unbuilt store-path executables, a runner without base
+          # units). Gate on the markers that mean the unit is actually bad --
+          # an unbalanced ExecStart quote produces exactly these, and a
+          # green run with a broken unit is how the pull unit reached prod.
+          out="$(nix run nixpkgs#systemd -- verify verified-units/* 2>&1 || true)"
+          printf '%s\n' "$out"
+          fatal="$(printf '%s\n' "$out" | grep -E 'Unbalanced quoting|bad unit file setting|fatal error' || true)"
+          if [ -n "$fatal" ]; then
+            echo "::error::systemd refused a generated unit" >&2
+            printf '%s\n' "$fatal" >&2
             exit 1
           fi
 
