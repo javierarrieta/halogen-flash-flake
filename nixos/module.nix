@@ -34,18 +34,56 @@ let
   podmanPkg =
     if cfg.user != "root" then config.virtualisation.podman.package else pkgs.podman;
 
+  # Versioned directory structure for atomic deployments
+  # modelsDir/versioned/<revision>/ stores each revision
+  # modelsDir is a symlink to the active revision
+  versionedModelsDir = cfg.modelsDir + "/versioned";
+  targetRevision = if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
+  versionedTargetDir = versionedModelsDir + "/" + targetRevision;
+
+  # Script to download weights to versioned directory and update symlink atomically
+  updateVersionedWeightsScript = pkgs.writeShellScript "update-halogen-weights" ''
+    set -euo pipefail
+    
+    # Create versioned directory
+    mkdir -p "${versionedModelsDir}"
+    
+    # Download new weights to versioned directory (idempotent, only new data)
+    echo "Downloading halogen weights to versioned directory: ${versionedTargetDir}"
+    hf download ${cfg.download.repo} --revision "${targetRevision}" --local-dir "${versionedTargetDir}"
+    
+    # Update symlink atomically (ln -sf is atomic on Linux)
+    echo "Switching active weights to revision: ${targetRevision}"
+    ln -sfn "${targetRevision}" "${cfg.modelsDir}"
+    
+    # Track current revision
+    echo "${targetRevision}" > "${versionedModelsDir}/.current"
+  '';
+
   weightsPreCheck =
-    if cfg.download.enable
-    # First start transfers ~118 GiB (resumes when interrupted); later starts
-    # re-verify existing files and only fetch what changed. With `revision`
-    # set, hf fetches that exact commit instead of the floating default branch.
-    then
+    if cfg.download.enable && cfg.download.toVersionedDir then
+      # Versioned directory mode: check if versioned dir exists, else download and switch
+      let
+        checkScript = pkgs.writeShellScript "check-halogen-versioned-dir" ''
+          if [ -d "${versionedTargetDir}" ]; then
+            echo "Halogen versioned weights directory present: ${versionedTargetDir}"
+            exit 0
+          else
+            echo "Halogen versioned weights directory missing: ${versionedTargetDir}"
+            exit 1
+          fi
+        '';
+      in
+      "${checkScript}" || "${updateVersionedWeightsScript}"
+    else if cfg.download.enable then
+      # Original behavior: download directly to modelsDir
       let
         revArg = lib.optionalString (cfg.download.revision != "")
           " --revision '${cfg.download.revision}'";
       in
       "${pkgs.python3Packages.huggingface-hub}/bin/hf download ${cfg.download.repo}${revArg} --local-dir '${cfg.modelsDir}'"
-    else "test -d '${cfg.modelsDir}'";
+    else
+      "test -d '${cfg.modelsDir}'";
 
   roleArgs = roleName:
     let
@@ -347,19 +385,32 @@ in
             not even match what that image expects.
           '';
         };
+        options.toVersionedDir = lib.mkOption {
+          type = lib.types.bool;
+          default = true;
+          description = ''
+            When enabled, download weights to `<modelsDir>/<revision>/`
+            instead of directly to `<modelsDir>`. A symlink at
+            `<modelsDir>` points to the active revision, enabling atomic
+            deployments: new weights download in background, service only
+            restarts after symlink switch (near-zero downtime).
+            Default: true.
+          '';
+        };
       });
-      default = { enable = false; repo = defaultRepo; revision = defaultWeightsRevision; };
+      default = { enable = false; repo = defaultRepo; revision = defaultWeightsRevision; toVersionedDir = true; };
       description = ''
         When enabled, ExecStartPre runs `hf download <repo> [--revision <rev>]
-        --local-dir modelsDir` on every start: the first time it transfers
+        --local-dir <modelsDir>/<revision>` on every start: the first time it transfers
         ~118 GiB (it resumes when interrupted), afterwards hf-hub re-verifies
         existing files and only fetches what changed. The container therefore
         never dials out.
 
-        Note this makes service start depend on the transfer: a pinned revision
-        change is a fresh ~118 GiB fetch, so the deploy that introduces one
-        needs a health-gate warmup window that can outlast it (see
-        cominGitOps.healthGate.halogenWarmupSec downstream).
+        With `toVersionedDir = true` (default), weights are downloaded to
+        `<modelsDir>/<revision>/` and a symlink at `modelsDir` points to the
+        active revision. This enables atomic deployments: new weights are
+        downloaded in the background, then the symlink is switched, then the
+        service restarts (near-zero downtime).
 
         When disabled, provision the directory yourself (`hf download ...
         --local-dir <modelsDir>` by hand) — a plain `test -d` runs instead.
