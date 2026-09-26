@@ -168,7 +168,7 @@ let
       # The sync unit owns the fetch. The role unit only refuses to start on
       # a missing tree — without this podman happily creates an empty bind
       # source and serves a model that is not there.
-      "test -d '${currentLink}'"
+      "${pkgs.coreutils}/bin/test -d '${currentLink}'"
     else if cfg.download.enable then
       # Unversioned: download straight into modelsDir on every start.
       # First start transfers ~118 GiB (resumes when interrupted); later
@@ -181,7 +181,7 @@ let
       in
       "${pkgs.python3Packages.huggingface-hub}/bin/hf download ${cfg.download.repo}${revArg} --local-dir '${cfg.modelsDir}'"
     else
-      "test -d '${cfg.modelsDir}'";
+      "${pkgs.coreutils}/bin/test -d '${cfg.modelsDir}'";
 
   roleArgs = roleName:
     let
