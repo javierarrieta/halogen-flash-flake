@@ -7,9 +7,30 @@
 #   --ipc=host                           load-bearing; no shm_size substitutes for it
 #   --ulimit memlock=-1:-1
 # The weights are NOT fetched from inside the container: this module either
-# uses a pre-provisioned directory or runs `hf download` as ExecStartPre (the
-# hf-hub CLI is idempotent and resumes/re-verifies), so the models volume can
-# be read-only and a deployed server makes no outbound connections.
+# uses a pre-provisioned directory or runs `hf download` (the hf-hub CLI is
+# idempotent and resumes/re-verifies), so the models volume can be read-only
+# and a deployed server makes no outbound connections.
+#
+# Versioned weights layout (the default, `download.toVersionedDir = true`).
+# `modelsDir` is the BASE directory, not the tree the server reads:
+#
+#   modelsDir/
+#   ├── .cache/                     hf metadata (survives version pruning)
+#   ├── versions/
+#   │   ├── e053f488.../            one weight tree per revision
+#   │   └── a1b2c3d4.../
+#   └── current -> versions/a1b2c3d4...
+#
+# The units mount `current`, so the mount path is CONSTANT across revisions.
+# That is what makes a weights update non-blocking: `halogen-flash-weights`
+# fetches the new tree while the old server keeps serving, flips the symlink,
+# and only then restarts the server to load it. A bind mount pins the inode
+# it was created from, so flipping the symlink never disturbs a running
+# container — the old tree stays valid for it until it is restarted.
+#
+# Disk is capped at TWO versions: the sync unit prunes every version dir that
+# is not the live one before it starts a fetch, so a revision bump never needs
+# room for three.
 { lib, pkgs, config, ... }:
 
 let
@@ -22,8 +43,8 @@ let
   # version. flake.lock freezes this source tree, so the string is transitively
   # pinned exactly like the image digest is -- neither artifact's bytes live in
   # the Nix store, the lock freezes the text that names them. Bump deliberately:
-  # a new revision makes the next start fetch ~118 GiB (see the health-gate
-  # warmup window downstream). scripts/bump-image.sh reports the upstream sha.
+  # a new revision makes the next sync fetch ~118 GiB. scripts/bump-image.sh
+  # reports the upstream sha.
   defaultWeightsRevision = "e053f488b120b99ed2525e6ac99f68c51b3b6179";
 
   # Rootless runs need the setuid newuidmap/newgidmap: plain pkgs.podman
@@ -34,49 +55,125 @@ let
   podmanPkg =
     if cfg.user != "root" then config.virtualisation.podman.package else pkgs.podman;
 
-  # Versioned directory structure for atomic deployments
-  # modelsDir/versioned/<revision>/ stores each revision
-  # modelsDir is a symlink to the active revision
-  versionedModelsDir = cfg.modelsDir + "/versioned";
-  targetRevision = if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
-  versionedTargetDir = versionedModelsDir + "/" + targetRevision;
+  # The versioned layout only exists when the module is the one fetching. With
+  # downloads off the operator owns modelsDir outright, so mount it directly
+  # and keep the pre-versioning behaviour byte-for-byte.
+  versionedActive = cfg.download.enable && cfg.download.toVersionedDir;
 
-  # Script to download weights to versioned directory and update symlink atomically
-  updateVersionedWeightsScript = pkgs.writeShellScript "update-halogen-weights" ''
-    set -euo pipefail
-    
-    # Create versioned directory
-    mkdir -p "${versionedModelsDir}"
-    
-    # Download new weights to versioned directory (idempotent, only new data)
-    echo "Downloading halogen weights to versioned directory: ${versionedTargetDir}"
-    hf download ${cfg.download.repo} --revision "${targetRevision}" --local-dir "${versionedTargetDir}"
-    
-    # Update symlink atomically (ln -sf is atomic on Linux)
-    echo "Switching active weights to revision: ${targetRevision}"
-    ln -sfn "${targetRevision}" "${cfg.modelsDir}"
-    
-    # Track current revision
-    echo "${targetRevision}" > "${versionedModelsDir}/.current"
+  versionsDir = "${cfg.modelsDir}/versions";
+  currentLink = "${cfg.modelsDir}/current";
+  targetRevision = if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
+  targetDir = "${versionsDir}/${targetRevision}";
+
+  # What the container actually mounts as /models. Constant under the
+  # versioned layout (that constancy is the whole point); the raw base dir
+  # otherwise.
+  mountSource = if versionedActive then currentLink else cfg.modelsDir;
+
+  # Units that read the weights tree, and therefore have to be restarted when
+  # the symlink flips. Names are spelled out rather than derived from mkRoleUnit
+  # so the restart target is obvious in the generated unit.
+  roleUnitNames = if cfg.mode == "all" then [ "halogen-flash" ] else [
+    "halogen-flash-engine"
+    "halogen-flash-api"
+  ];
+
+  # Fetch the pinned revision, prune what it displaced, then move the server
+  # onto it. Runs as root: it must be able to restart the server units, and
+  # the weight files it writes are world-readable, so the service user reads
+  # them without owning them.
+  weightsSyncScript = pkgs.writeShellScript "halogen-weights-sync" ''
+    set -eu
+
+    modelsDir=${cfg.modelsDir}
+    versionsDir=${versionsDir}
+    currentLink=${currentLink}
+    targetDir=${targetDir}
+    repo=${cfg.download.repo}
+    revision=${targetRevision}
+    hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
+    restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
+
+    mkdir -p "$versionsDir"
+
+    # The symlink is the single source of truth for what is live: the running
+    # container has whatever it pointed at bind-mounted, and that binding
+    # survives the link being flipped underneath it.
+    active=""
+    if [ -L "$currentLink" ]; then
+      active="$(basename "$(readlink "$currentLink")")"
+    fi
+
+    if [ "$active" = "$revision" ] && [ -d "$targetDir" ]; then
+      echo "halogen-weights: revision $revision already active, nothing to do"
+      exit 0
+    fi
+
+    # One-time migration guard. A pre-versioning install left the .hgn files
+    # flat in modelsDir, and nothing on them says which revision they are.
+    # Fetching a second copy into versions/ would need double the volume, so
+    # refuse and let a human decide rather than silently filling the disk.
+    if [ ! -L "$currentLink" ] && ls "$modelsDir"/*.hgn >/dev/null 2>&1; then
+      echo "halogen-weights: legacy flat weights in $modelsDir and no 'current' symlink." >&2
+      echo "halogen-weights: refusing to fetch a second ~118 GiB copy. Pick one:" >&2
+      echo "  a) if those files ARE revision $revision:" >&2
+      echo "       systemctl stop ${lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames}" >&2
+      echo "       mkdir -p '$targetDir'" >&2
+      echo "       mv '$modelsDir'/*.hgn '$modelsDir'/tokenizer '$targetDir'/" >&2
+      echo "     then re-run this unit; hf re-verifies the moved files." >&2
+      echo "  b) or delete them and let this unit fetch a fresh copy." >&2
+      exit 1
+    fi
+
+    # Free the space BEFORE the fetch: keep only the tree the live server is
+    # using, drop every other version. This also clears a half-fetched tree
+    # left behind by an aborted run, so a retry never stacks on a partial.
+    # Result: at most two versions on disk, the live one plus this fetch.
+    for d in "$versionsDir"/*; do
+      [ -d "$d" ] || continue
+      name="$(basename "$d")"
+      if [ "$name" != "$active" ] && [ "$name" != "$revision" ]; then
+        echo "halogen-weights: pruning superseded version $d"
+        rm -rf "$d"
+      fi
+    done
+
+    if [ -d "$targetDir" ]; then
+      echo "halogen-weights: $targetDir already on disk, skipping fetch"
+    else
+      echo "halogen-weights: fetching $repo @ $revision into $targetDir"
+      "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir"
+    fi
+
+    # Atomic swap. `ln -sf` onto an existing symlink-to-a-directory follows
+    # the link and creates the new one INSIDE it; rename(2) over the link
+    # replaces the link itself, so stage under a temp name and move.
+    tmpLink="$currentLink.new.$$"
+    ln -s "$targetDir" "$tmpLink"
+    mv -T "$tmpLink" "$currentLink"
+    echo "halogen-weights: $currentLink -> $targetDir"
+
+    # The new tree is on disk and linked; now it is safe to move the server
+    # onto it. try-restart so a host that has the unit masked does not fail
+    # the sync.
+    if [ -n "$restartUnits" ]; then
+      echo "halogen-weights: restarting $restartUnits to load $revision"
+      systemctl try-restart $restartUnits
+    fi
   '';
 
   weightsPreCheck =
-    if cfg.download.enable && cfg.download.toVersionedDir then
-      # Versioned directory mode: check if versioned dir exists, else download and switch
-      let
-        checkScript = pkgs.writeShellScript "check-halogen-versioned-dir" ''
-          if [ -d "${versionedTargetDir}" ]; then
-            echo "Halogen versioned weights directory present: ${versionedTargetDir}"
-            exit 0
-          else
-            echo "Halogen versioned weights directory missing: ${versionedTargetDir}"
-            exit 1
-          fi
-        '';
-      in
-      "${checkScript}" || "${updateVersionedWeightsScript}"
+    if versionedActive then
+      # The sync unit owns the fetch. The role unit only refuses to start on
+      # a missing tree — without this podman happily creates an empty bind
+      # source and serves a model that is not there.
+      "test -d '${currentLink}'"
     else if cfg.download.enable then
-      # Original behavior: download directly to modelsDir
+      # Unversioned: download straight into modelsDir on every start.
+      # First start transfers ~118 GiB (resumes when interrupted); later
+      # starts re-verify existing files and only fetch what changed. With
+      # `revision` set, hf fetches that exact commit instead of the floating
+      # default branch.
       let
         revArg = lib.optionalString (cfg.download.revision != "")
           " --revision '${cfg.download.revision}'";
@@ -90,7 +187,7 @@ let
       # Do not mirror shipped defaults here — when the image changes, a stale
       # override silently wins (upstream's own words on their compose file).
       extraEnv = (lib.optionalAttrs cfg.enableVision {
-        HALOGEN_VISION_TOWER = "${cfg.modelsDir}/qwen38-flash-next-vision.hgn";
+        HALOGEN_VISION_TOWER = "${mountSource}/qwen38-flash-next-vision.hgn";
       })
       // cfg.environment;
     in
@@ -114,15 +211,17 @@ let
       "--ulimit"
       "memlock=-1:-1"
       # Holds checkpoint + quality sidecar + tokenizer/; read-only, and every
-      # role reads it (the API needs the tokenizer).
+      # role reads it (the API needs the tokenizer). Under the versioned
+      # layout this is the `current` symlink, so the source path never moves
+      # across a weights bump.
       "-v"
-      "${cfg.modelsDir}:/models:ro"
+      "${mountSource}:/models:ro"
       # Upstream's HALOGEN_TOKENIZER default points at /tokenizer — a second
       # mount in their examples. Ours is the same tree; mount it where the
       # image expects it (harmless if the image already looks at
       # /models/tokenizer).
       "-v"
-      "${cfg.modelsDir}/tokenizer:/tokenizer:ro"
+      "${mountSource}/tokenizer:/tokenizer:ro"
     ]
     # All modes run on the host network (upstream's split topology): the
     # engine binds the host's loopback (HALOGEN_BIND default 127.0.0.1,
@@ -214,7 +313,13 @@ let
       # when the pinned artifact is already local, so this does not make
       # boot contingent on the registry being reachable.
       (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ])
-      ++ (lib.optionals cfg.download.enable [ "network-online.target" ])
+      # On a fresh boot wait for the weights oneshot to finish (a oneshot
+      # only reaches "started" once ExecStart exits 0), so the server does
+      # not crash-loop against a tree that is still downloading. Deliberately
+      # After= only, never Requires=: Requires would propagate a restart of
+      # the sync unit into the server every time it merely re-ran.
+      ++ (lib.optionals versionedActive [ "halogen-flash-weights.service" ])
+      ++ (lib.optionals (cfg.download.enable && !versionedActive) [ "network-online.target" ])
       # split mode: don't race the engine to boot; its weight load takes
       # minutes and an API that starts first crash-loops until it is ready.
       ++ lib.optional (cfg.mode == "split" && roleName == "api") "halogen-flash-engine.service";
@@ -227,8 +332,11 @@ let
       Environment = unitEnvironment;
       ExecStartPre = [ weightsPreCheck ];
       # Generous headroom only while we fetch: the first ever start pulls
-      # ~118 GiB of weights. (mkIf rather than optionalString: an empty
-      # TimeoutStartSec= is a parse failure systemd only warns about.)
+      # ~118 GiB of weights. Under the versioned layout the fetch lives in
+      # the sync unit, so this only has to cover a weight load (minutes),
+      # but keep the long ceiling for the unversioned path.
+      # (mkIf rather than optionalString: an empty TimeoutStartSec= is a
+      # parse failure systemd only warns about.)
       TimeoutStartSec = lib.mkIf cfg.download.enable "2d";
       # memlock=-1:-1 (upstream contract) needs to RAISE the hard limit — a
       # privileged operation. systemd applies this as root before switching
@@ -270,6 +378,11 @@ in
         does not help. The user needs render/video group access for /dev/kfd
         + /dev/dri; the module handles linger, subuid/subgid range
         allocation and ownership of modelsDir/podmanHome (tmpfiles).
+
+        The weights sync unit always runs as root regardless of this option,
+        because it has to restart the server units once a new tree lands.
+        Files it writes are world-readable, so the service user reads them
+        fine without owning them.
       '';
     };
 
@@ -358,9 +471,14 @@ in
       default = "/var/lib/halogen/models";
       example = "/opt/llm/halogen/models";
       description = ''
-        Directory holding the checkpoint, quality sidecar and tokenizer/ — the
-        same directory `hf download <repo> --local-dir` writes. Needs ~130 GiB
-        of headroom on a big volume (on llm01 that is /opt/llm).
+        Base directory for the weights. With `download.toVersionedDir` (the
+        default) it holds `versions/<revision>/` plus a `current` symlink,
+        and the container mounts `current` as /models — so this path stays
+        constant across weight bumps. Needs ~2x the weight size of headroom
+        on a big volume during a bump (on llm01 that is /opt/llm).
+
+        With versioning off it is the weight tree itself, exactly as
+        `hf download <repo> --local-dir` writes it.
       '';
     };
 
@@ -389,28 +507,51 @@ in
           type = lib.types.bool;
           default = true;
           description = ''
-            When enabled, download weights to `<modelsDir>/<revision>/`
-            instead of directly to `<modelsDir>`. A symlink at
-            `<modelsDir>` points to the active revision, enabling atomic
-            deployments: new weights download in background, service only
-            restarts after symlink switch (near-zero downtime).
-            Default: true.
+            Fetch into `<modelsDir>/versions/<revision>/` and point
+            `<modelsDir>/current` at the live revision, instead of pulling
+            straight into `modelsDir`.
+
+            Because the units mount `current`, a revision bump no longer
+            changes the server units at all: `halogen-flash-weights.service`
+            downloads the new tree while the old server keeps serving, flips
+            the symlink, and only then restarts the server to load it. The
+            window where the server is down is the weight load (minutes), not
+            the ~118 GiB transfer (hours).
+
+            Superseded versions are pruned BEFORE each fetch, so the volume
+            only ever needs room for two: the live tree and the one being
+            fetched. Roll back by pointing `current` at the older tree and
+            restarting.
+
+            Set false for the original behaviour (fetch into `modelsDir` in
+            the role unit's ExecStartPre, which blocks startup).
           '';
         };
       });
-      default = { enable = false; repo = defaultRepo; revision = defaultWeightsRevision; toVersionedDir = true; };
+      default = {
+        enable = false;
+        repo = defaultRepo;
+        revision = defaultWeightsRevision;
+        toVersionedDir = true;
+      };
       description = ''
-        When enabled, ExecStartPre runs `hf download <repo> [--revision <rev>]
-        --local-dir <modelsDir>/<revision>` on every start: the first time it transfers
-        ~118 GiB (it resumes when interrupted), afterwards hf-hub re-verifies
-        existing files and only fetches what changed. The container therefore
-        never dials out.
+        When enabled, the weights are fetched with `hf download <repo>
+        --revision <rev> --local-dir <dir>`: the first time it transfers
+        ~118 GiB (it resumes when interrupted), afterwards hf-hub
+        re-verifies existing files and only fetches what changed. The
+        container therefore never dials out.
 
-        With `toVersionedDir = true` (default), weights are downloaded to
-        `<modelsDir>/<revision>/` and a symlink at `modelsDir` points to the
-        active revision. This enables atomic deployments: new weights are
-        downloaded in the background, then the symlink is switched, then the
-        service restarts (near-zero downtime).
+        With `toVersionedDir = true` (default) that fetch runs in its own
+        `halogen-flash-weights.service` oneshot, which prunes superseded
+        versions first, then atomically flips the `current` symlink and
+        restarts the server units. A revision change is therefore a
+        background download followed by a short reload.
+
+        With `toVersionedDir = false` the fetch runs in the role unit's
+        ExecStartPre, so the deploy that introduces a revision change is
+        down for the whole transfer and needs a health-gate warmup window
+        that can outlast it (see cominGitOps.healthGate.halogenWarmupSec
+        downstream).
 
         When disabled, provision the directory yourself (`hf download ...
         --local-dir <modelsDir>` by hand) — a plain `test -d` runs instead.
@@ -421,12 +562,12 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Set HALOGEN_VISION_TOWER to the vision sidecar inside modelsDir so
-        images are accepted on /v1. The engine wants a PATH (it names the
-        file it found, e.g. /models/qwen38-flash-next-vision.hgn); the
-        sidecar must have been downloaded with the weights. Off by default:
-        a text-only server is byte-identical to a build without any of it
-        and allocates nothing for it.
+        Set HALOGEN_VISION_TOWER to the vision sidecar inside the mounted
+        tree so images are accepted on /v1. The engine wants a PATH (it
+        names the file it found, e.g. /models/qwen38-flash-next-vision.hgn);
+        the sidecar must have been downloaded with the weights. Off by
+        default: a text-only server is byte-identical to a build without any
+        of it and allocates nothing for it.
       '';
     };
 
@@ -466,6 +607,36 @@ in
           systemd.services."halogen-flash" = mkRoleUnit "all";
         }
       )
+      # The weights sync unit. Wanted by multi-user.target and NOT Required by
+      # the server units: it runs on boot and on every switch whose revision
+      # differs, and exits immediately when nothing changed. Keeping it out of
+      # the server's Requires= means re-running it never propagates a restart
+      # into a healthy server.
+      (
+        lib.mkIf (cfg.enable && versionedActive) {
+          systemd.services."halogen-flash-weights" = {
+            description = "Sync halogen-flash weights to ${targetRevision}";
+            wantedBy = [ "multi-user.target" ];
+            after = [ "network-online.target" ];
+            wants = [ "network-online.target" ];
+            serviceConfig = {
+              Type = "oneshot";
+              RemainAfterExit = true;
+              # root, not cfg.user: the unit restarts the server units after
+              # flipping the symlink, which a non-root user cannot do.
+              User = "root";
+              # Same hub cache location the role units use, under the BASE dir
+              # so pruning a version never throws away resumable metadata.
+              Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
+              ExecStart = weightsSyncScript;
+              # A revision bump is a fresh ~118 GiB transfer.
+              TimeoutStartSec = "2d";
+              Restart = "on-failure";
+              RestartSec = "60";
+            };
+          };
+        }
+      )
       (
         lib.mkIf (cfg.enable && cfg.pull.enable) {
           systemd.services."halogen-flash-pull" = {
@@ -487,7 +658,7 @@ in
               # The image is the engine + front-end only (a few GiB); the
               # ~118 GiB of weights are a separate volume and untouched
               # here. Generous, but bounded well below the weight-fetch
-              # timeout on the role units.
+              # timeout on the sync unit.
               TimeoutStartSec = "30min";
             };
           };
@@ -550,7 +721,10 @@ in
             # creates it for linger, but can race the unit on a fresh switch.
             "d /run/user/${toString config.users.users.${cfg.user}.uid} 0700 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
             "d ${cfg.podmanHome} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
-            "Z ${cfg.modelsDir} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+            # The base dir has to exist before the sync unit runs as root, and
+            # Z keeps a pre-fetched tree readable by the service user.
+            "d ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+            "Z ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
           ];
         }
       )
