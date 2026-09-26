@@ -92,6 +92,7 @@ let
     repo=${cfg.download.repo}
     revision=${targetRevision}
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
+    systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
 
     mkdir -p "$versionsDir"
@@ -158,7 +159,7 @@ let
     # the sync.
     if [ -n "$restartUnits" ]; then
       echo "halogen-weights: restarting $restartUnits to load $revision"
-      systemctl try-restart $restartUnits
+      "$systemctl" try-restart $restartUnits
     fi
   '';
 
