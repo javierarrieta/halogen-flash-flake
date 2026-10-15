@@ -62,6 +62,9 @@ jobs:
       current_weights: ${{ steps.bump.outputs.current_weights }}
       new_weights: ${{ steps.bump.outputs.new_weights }}
       weights_probe: ${{ steps.bump.outputs.weights_probe }}
+      exclude_changed: ${{ steps.bump.outputs.exclude_changed }}
+      download_gib: ${{ steps.bump.outputs.download_gib }}
+      exclude_review: ${{ steps.bump.outputs.exclude_review }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,6 +118,9 @@ jobs:
           CURRENT_WEIGHTS: ${{ steps.bump.outputs.current_weights }}
           NEW_WEIGHTS: ${{ steps.bump.outputs.new_weights }}
           WEIGHTS_PROBE: ${{ steps.bump.outputs.weights_probe }}
+          EXCLUDE_CHANGED: ${{ steps.bump.outputs.exclude_changed }}
+          DOWNLOAD_GIB: ${{ steps.bump.outputs.download_gib }}
+          EXCLUDE_REVIEW: ${{ steps.bump.outputs.exclude_review }}
         run: |
           {
             if [ "$OUTCOME" = "failure" ]; then
@@ -138,6 +144,12 @@ jobs:
                 echo "- weights: \`${CURRENT_WEIGHTS:-unpinned}\` -> \`${NEW_WEIGHTS}\`"
               else
                 echo "- weights: unchanged"
+              fi
+              if [ "$EXCLUDE_CHANGED" = "true" ]; then
+                echo "- download.exclude re-derived (projected download \`${DOWNLOAD_GIB:-?} GiB\`)"
+                if [ "$EXCLUDE_REVIEW" = "true" ]; then
+                  echo "- **exclude changes need review** (auto-added new files, stale patterns, or over budget)"
+                fi
               fi
             fi
             if [ -n "$DIGEST" ]; then
