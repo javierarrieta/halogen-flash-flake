@@ -28,9 +28,25 @@
 # it was created from, so flipping the symlink never disturbs a running
 # container — the old tree stays valid for it until it is restarted.
 #
+# The fetch is NOT part of the deploy. The switch writes the desired revision to
+# /etc/halogen-flash/target-revision and returns; `halogen-flash-weights.path`
+# watches that file and starts the sync unit when its contents change. For that
+# to hold, the sync unit's generated text must be byte-identical across
+# revisions: switch-to-configuration restarts any unit whose text changed, so
+# interpolating the revision into the description or the ExecStart script would
+# restart the fetch unit on every bump and hold the server behind it. The
+# revision is read from the intent file at run time instead.
+#
+# Two things follow from that and must not be "helpfully" reverted:
+#   * the sync unit's `description` is a fixed string;
+#   * the sync unit has NO RemainAfterExit — a PathUnit activates with StartUnit,
+#     which is a no-op on an already-active RemainAfterExit oneshot, so keeping
+#     it would make every bump after the first silently do nothing.
+# tests/test-unit-invariance.sh asserts the first and pins the second.
+#
 # Disk is capped at TWO versions: the sync unit prunes every version dir that
 # is not the live one before it starts a fetch, so a revision bump never needs
-# room for three.
+# room for three. That prune is unchanged and load-bearing.
 {
   lib,
   pkgs,
@@ -482,7 +498,9 @@ in
         The weights sync unit always runs as root regardless of this option,
         because it has to restart the server units once a new tree lands.
         Files it writes are world-readable, so the service user reads them
-        fine without owning them.
+        fine without owning them. That unit is started by
+        `halogen-flash-weights.path` when the declared revision changes, not by
+        the switch.
       '';
     };
 
@@ -590,7 +608,7 @@ in
     download = lib.mkOption {
       type = lib.types.submodule (
         { ... }: rec {
-          options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub before each start";
+          options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub";
           options.repo = lib.mkOption {
             type = lib.types.str;
             default = defaultRepo;
@@ -618,16 +636,20 @@ in
               straight into `modelsDir`.
 
               Because the units mount `current`, a revision bump no longer
-              changes the server units at all: `halogen-flash-weights.service`
-              downloads the new tree while the old server keeps serving, flips
-              the symlink, and only then restarts the server to load it. The
-              window where the server is down is the weight load (minutes), not
-              the ~118 GiB transfer (hours).
+              changes the server units at all. The switch writes the revision to
+              /etc/halogen-flash/target-revision and returns in seconds;
+              `halogen-flash-weights.path` then starts
+              `halogen-flash-weights.service`, which downloads the new tree
+              while the old server keeps serving, flips the symlink, and only
+              then restarts the server to load it. The deploy never waits on the
+              transfer, and the window where the server is down is the weight
+              load (minutes), not the ~112 GiB transfer (hours).
 
               Superseded versions are pruned BEFORE each fetch, so the volume
               only ever needs room for two: the live tree and the one being
-              fetched. Roll back by pointing `current` at the older tree and
-              restarting.
+              fetched. Roll back by writing the older revision to the intent
+              file (or pointing `current` at the older tree) and letting the
+              path unit act.
 
               Set false for the original behaviour (fetch into `modelsDir` in
               the role unit's ExecStartPre, which blocks startup).
@@ -674,10 +696,13 @@ in
         container therefore never dials out.
 
         With `toVersionedDir = true` (default) that fetch runs in its own
-        `halogen-flash-weights.service` oneshot, which prunes superseded
-        versions first, then atomically flips the `current` symlink and
-        restarts the server units. A revision change is therefore a
-        background download followed by a short reload.
+        `halogen-flash-weights.service` oneshot, triggered by
+        `halogen-flash-weights.path` when the declared revision changes rather
+        than by the switch. It prunes superseded versions first, then atomically
+        flips the `current` symlink and restarts the server units. A revision
+        change is therefore a deploy that returns immediately, a background
+        download, and one short reload — and a failed download fails only the
+        weights unit, never the deploy that requested it.
 
         With `toVersionedDir = false` the fetch runs in the role unit's
         ExecStartPre, so the deploy that introduces a revision change is
