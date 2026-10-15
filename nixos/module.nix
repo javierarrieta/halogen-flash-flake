@@ -68,7 +68,6 @@ let
   currentLink = "${cfg.modelsDir}/current";
   targetRevision =
     if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
-  targetDir = "${versionsDir}/${targetRevision}";
 
   # What the container actually mounts as /models. Constant under the
   # versioned layout (that constancy is the whole point); the raw base dir
@@ -97,9 +96,8 @@ let
     modelsDir=${cfg.modelsDir}
     versionsDir=${versionsDir}
     currentLink=${currentLink}
-    targetDir=${targetDir}
     repo=${cfg.download.repo}
-    revision=${targetRevision}
+    targetRevisionFile=/etc/halogen-flash/target-revision
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
     systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
@@ -109,6 +107,20 @@ let
     exclusionsStr=${lib.escapeShellArg (lib.concatStringsSep "|" cfg.download.exclude)}
 
     mkdir -p "$versionsDir"
+
+    # The revision is run-time state, not build-time text: baking it into the
+    # script made every bump rewrite the unit's ExecStart path, which is exactly
+    # the restart we are trying to avoid.
+    if [ ! -r "$targetRevisionFile" ]; then
+      echo "halogen-weights: $targetRevisionFile not readable; nothing to do" >&2
+      exit 1
+    fi
+    revision="$(tr -d '[:space:]' < "$targetRevisionFile")"
+    if [ -z "$revision" ]; then
+      echo "halogen-weights: $targetRevisionFile is empty; refusing to guess" >&2
+      exit 1
+    fi
+    targetDir="$versionsDir/$revision"
 
     # The symlink is the single source of truth for what is live: the running
     # container has whatever it pointed at bind-mounted, and that binding
@@ -703,6 +715,13 @@ in
     # differs, and exits immediately when nothing changed. Keeping it out of
     # the server's Requires= means re-running it never propagates a restart
     # into a healthy server.
+    (lib.mkIf (cfg.enable && versionedActive) {
+      # The declared intent. Written on every activation; its bytes change only
+      # when the pinned revision is bumped, so a no-change deploy fires nothing.
+      # environment.etc (not tmpfiles) because it renames into place atomically
+      # and always exists after activation, which is what PathChanged needs.
+      environment.etc."halogen-flash/target-revision".text = "${targetRevision}\n";
+    })
     (lib.mkIf (cfg.enable && versionedActive) {
       systemd.services."halogen-flash-weights" = {
         description = "Sync halogen-flash weights to ${targetRevision}";
