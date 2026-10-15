@@ -28,9 +28,25 @@
 # it was created from, so flipping the symlink never disturbs a running
 # container — the old tree stays valid for it until it is restarted.
 #
+# The fetch is NOT part of the deploy. The switch writes the desired revision to
+# /etc/halogen-flash/target-revision and returns; `halogen-flash-weights.path`
+# watches that file and starts the sync unit when its contents change. For that
+# to hold, the sync unit's generated text must be byte-identical across
+# revisions: switch-to-configuration restarts any unit whose text changed, so
+# interpolating the revision into the description or the ExecStart script would
+# restart the fetch unit on every bump and hold the server behind it. The
+# revision is read from the intent file at run time instead.
+#
+# Two things follow from that and must not be "helpfully" reverted:
+#   * the sync unit's `description` is a fixed string;
+#   * the sync unit has NO RemainAfterExit — a PathUnit activates with StartUnit,
+#     which is a no-op on an already-active RemainAfterExit oneshot, so keeping
+#     it would make every bump after the first silently do nothing.
+# tests/test-unit-invariance.sh asserts the first and pins the second.
+#
 # Disk is capped at TWO versions: the sync unit prunes every version dir that
 # is not the live one before it starts a fetch, so a revision bump never needs
-# room for three.
+# room for three. That prune is unchanged and load-bearing.
 {
   lib,
   pkgs,
@@ -68,7 +84,6 @@ let
   currentLink = "${cfg.modelsDir}/current";
   targetRevision =
     if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
-  targetDir = "${versionsDir}/${targetRevision}";
 
   # What the container actually mounts as /models. Constant under the
   # versioned layout (that constancy is the whole point); the raw base dir
@@ -97,9 +112,8 @@ let
     modelsDir=${cfg.modelsDir}
     versionsDir=${versionsDir}
     currentLink=${currentLink}
-    targetDir=${targetDir}
     repo=${cfg.download.repo}
-    revision=${targetRevision}
+    targetRevisionFile=/etc/halogen-flash/target-revision
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
     systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
@@ -109,6 +123,39 @@ let
     exclusionsStr=${lib.escapeShellArg (lib.concatStringsSep "|" cfg.download.exclude)}
 
     mkdir -p "$versionsDir"
+
+    textfileDir=${lib.escapeShellArg cfg.metricsTextfileDir}
+    write_metric() {
+      # Empty dir means metrics disabled on this host.
+      [ -n "$textfileDir" ] || return 0
+      mkdir -p "$textfileDir"
+      {
+        printf 'halogen_weights_desired_revision_info{revision="%s"} 1\n' "''${revision:-unknown}"
+        printf 'halogen_weights_current_revision_info{revision="%s"} 1\n' "''${active:-none}"
+        printf 'halogen_weights_state{state="%s"} 1\n' "$1"
+      } > "$textfileDir/halogen-weights.prom.tmp.$$"
+      mv "$textfileDir/halogen-weights.prom.tmp.$$" "$textfileDir/halogen-weights.prom"
+    }
+
+    # Installed before anything can fail, so a failure that happens before the
+    # intent file is even readable still publishes `failed` instead of leaving a
+    # previous run's `complete` on the wire while the unit churns. The success
+    # paths below clear the trap so they are not overwritten on the way out.
+    trap 'write_metric failed' EXIT
+
+    # The revision is run-time state, not build-time text: baking it into the
+    # script made every bump rewrite the unit's ExecStart path, which is exactly
+    # the restart we are trying to avoid.
+    if [ ! -r "$targetRevisionFile" ]; then
+      echo "halogen-weights: $targetRevisionFile not readable; nothing to do" >&2
+      exit 1
+    fi
+    revision="$(tr -d '[:space:]' < "$targetRevisionFile")"
+    if [ -z "$revision" ]; then
+      echo "halogen-weights: $targetRevisionFile is empty; refusing to guess" >&2
+      exit 1
+    fi
+    targetDir="$versionsDir/$revision"
 
     # The symlink is the single source of truth for what is live: the running
     # container has whatever it pointed at bind-mounted, and that binding
@@ -120,6 +167,8 @@ let
 
     if [ "$active" = "$revision" ] && [ -d "$targetDir" ]; then
       echo "halogen-weights: revision $revision already active, nothing to do"
+      trap - EXIT
+      write_metric complete
       exit 0
     fi
 
@@ -159,6 +208,8 @@ let
         read -r firstLine < "$markerFile"
         if [ "$firstLine" = "$expectedMarker" ]; then
           echo "halogen-weights: $targetDir complete (rev=$revision, excl=$exclusionsStr), nothing to do"
+          trap - EXIT
+          write_metric complete
           exit 0
         else
           echo "halogen-weights: $targetDir exists but exclusions/revision changed; will fetch (resumes from existing files)"
@@ -170,10 +221,13 @@ let
         # previously absent can be added now without deleting anything.
         echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=$revision)"
         echo "$expectedMarker" > "$markerFile"
+        trap - EXIT
+        write_metric complete
         exit 0
       fi
     fi
 
+    write_metric fetching
     echo "halogen-weights: fetching $repo @ $revision into $targetDir"
     "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" "''${excludeFlags[@]}"
 
@@ -191,13 +245,43 @@ let
     ln -s "$targetDir" "$tmpLink"
     mv -T "$tmpLink" "$currentLink"
     echo "halogen-weights: $currentLink -> $targetDir"
+    trap - EXIT
 
     # The new tree is on disk and linked; now it is safe to move the server
     # onto it. try-restart so a host that has the unit masked does not fail
     # the sync.
     if [ -n "$restartUnits" ]; then
       echo "halogen-weights: restarting $restartUnits to load $revision"
-      "$systemctl" try-restart $restartUnits
+      # The bump is only actually deployed once the server runs on the new tree.
+      # try-restart exits 0 even for a unit that fails to come back, so the
+      # outcome is checked rather than publishing `complete` over a dead server.
+      "$systemctl" try-restart $restartUnits || {
+        echo "halogen-weights: restart of $restartUnits failed" >&2
+        write_metric restart_failed
+        exit 1
+      }
+      for _u in $restartUnits; do
+        if ! "$systemctl" is-active --quiet "$_u"; then
+          echo "halogen-weights: $_u is not active after the restart" >&2
+          write_metric restart_failed
+          exit 1
+        fi
+      done
+    fi
+    write_metric complete
+
+    # A bump that landed while this fetch was running is not silently dropped.
+    # The path unit activates this service with StartUnit, which is a no-op while
+    # it is already activating, so without this the newer intent would not be
+    # picked up until the next change or a reboot. Exiting non-zero lets the
+    # restart policy run the reconciler against the new intent.
+    if [ -r "$targetRevisionFile" ]; then
+      _now="$(tr -d '[:space:]' < "$targetRevisionFile")"
+      if [ -n "$_now" ] && [ "$_now" != "$revision" ]; then
+        echo "halogen-weights: intent moved to $_now mid-run; requeueing" >&2
+        write_metric superseded
+        exit 1
+      fi
     fi
   '';
 
@@ -372,12 +456,11 @@ let
       # when the pinned artifact is already local, so this does not make
       # boot contingent on the registry being reachable.
       (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ])
-      # On a fresh boot wait for the weights oneshot to finish (a oneshot
-      # only reaches "started" once ExecStart exits 0), so the server does
-      # not crash-loop against a tree that is still downloading. Deliberately
-      # After= only, never Requires=: Requires would propagate a restart of
-      # the sync unit into the server every time it merely re-ran.
-      ++ (lib.optionals versionedActive [ "halogen-flash-weights.service" ])
+      # No edge on halogen-flash-weights.service: the fetch is a background
+      # reconciler now, and ordering here would let a multi-hour download delay
+      # a server restart. ExecStartPre's `test -d` is the only guard -- on a
+      # fresh host with no weights the unit fails loudly and retries, which is
+      # the same contract the pull unit has for a missing image.
       ++ (lib.optionals (cfg.download.enable && !versionedActive) [ "network-online.target" ])
       # split mode: don't race the engine to boot; its weight load takes
       # minutes and an API that starts first crash-loops until it is ready.
@@ -402,8 +485,12 @@ let
       # to User=, which is what makes the rootless podman run able to honor
       # it; without it podman exits immediately with EPERM as non-root.
       LimitMEMLOCK = "infinity";
-      # Weight reloads take minutes; give repeated load failures real room,
-      # but keep a crash-loop guard (5 starts in 30 s gives up).
+      # Weight reloads take minutes; give repeated load failures real room.
+      # No StartLimit* here on purpose: the manager default is 5 starts in 10 s,
+      # which RestartSec=30 never reaches, so a failed load keeps retrying until
+      # the weights unit flips `current` and restarts it. That unbounded retry is
+      # what lets a host that booted before its weights existed recover on its
+      # own once the fetch lands.
       Restart = "on-failure";
       RestartSec = "30";
       # systemd splits ExecStart itself (no shell): flag/value pairs stay
@@ -444,7 +531,9 @@ in
         The weights sync unit always runs as root regardless of this option,
         because it has to restart the server units once a new tree lands.
         Files it writes are world-readable, so the service user reads them
-        fine without owning them.
+        fine without owning them. That unit is started by
+        `halogen-flash-weights.path` when the declared revision changes, not by
+        the switch.
       '';
     };
 
@@ -552,7 +641,7 @@ in
     download = lib.mkOption {
       type = lib.types.submodule (
         { ... }: rec {
-          options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub before each start";
+          options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub";
           options.repo = lib.mkOption {
             type = lib.types.str;
             default = defaultRepo;
@@ -580,16 +669,20 @@ in
               straight into `modelsDir`.
 
               Because the units mount `current`, a revision bump no longer
-              changes the server units at all: `halogen-flash-weights.service`
-              downloads the new tree while the old server keeps serving, flips
-              the symlink, and only then restarts the server to load it. The
-              window where the server is down is the weight load (minutes), not
-              the ~118 GiB transfer (hours).
+              changes the server units at all. The switch writes the revision to
+              /etc/halogen-flash/target-revision and returns in seconds;
+              `halogen-flash-weights.path` then starts
+              `halogen-flash-weights.service`, which downloads the new tree
+              while the old server keeps serving, flips the symlink, and only
+              then restarts the server to load it. The deploy never waits on the
+              transfer, and the window where the server is down is the weight
+              load (minutes), not the ~112 GiB transfer (hours).
 
               Superseded versions are pruned BEFORE each fetch, so the volume
               only ever needs room for two: the live tree and the one being
-              fetched. Roll back by pointing `current` at the older tree and
-              restarting.
+              fetched. Roll back by writing the older revision to the intent
+              file (or pointing `current` at the older tree) and letting the
+              path unit act.
 
               Set false for the original behaviour (fetch into `modelsDir` in
               the role unit's ExecStartPre, which blocks startup).
@@ -636,10 +729,13 @@ in
         container therefore never dials out.
 
         With `toVersionedDir = true` (default) that fetch runs in its own
-        `halogen-flash-weights.service` oneshot, which prunes superseded
-        versions first, then atomically flips the `current` symlink and
-        restarts the server units. A revision change is therefore a
-        background download followed by a short reload.
+        `halogen-flash-weights.service` oneshot, triggered by
+        `halogen-flash-weights.path` when the declared revision changes rather
+        than by the switch. It prunes superseded versions first, then atomically
+        flips the `current` symlink and restarts the server units. A revision
+        change is therefore a deploy that returns immediately, a background
+        download, and one short reload — and a failed download fails only the
+        weights unit, never the deploy that requested it.
 
         With `toVersionedDir = false` the fetch runs in the role unit's
         ExecStartPre, so the deploy that introduces a revision change is
@@ -649,6 +745,23 @@ in
 
         When disabled, provision the directory yourself (`hf download ...
         --local-dir <modelsDir>` by hand) — a plain `test -d` runs instead.
+      '';
+    };
+
+    metricsTextfileDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/node-exporter/textfiles";
+      example = "";
+      description = ''
+        Directory for the `halogen-weights.prom` node_exporter textfile, or ""
+        to disable metric emission. The sync unit records the desired revision,
+        the live revision, and its own state there at every transition.
+
+        This exists because a decoupled fetch can fail long after the deploy
+        that requested it reported success; without this the failure is
+        invisible to monitoring. The directory must be one node_exporter
+        actually reads -- enabling the textfile collector is the host's job,
+        not this module's.
       '';
     };
 
@@ -698,20 +811,34 @@ in
     (lib.mkIf (cfg.enable && cfg.mode == "all") {
       systemd.services."halogen-flash" = mkRoleUnit "all";
     })
-    # The weights sync unit. Wanted by multi-user.target and NOT Required by
-    # the server units: it runs on boot and on every switch whose revision
-    # differs, and exits immediately when nothing changed. Keeping it out of
-    # the server's Requires= means re-running it never propagates a restart
-    # into a healthy server.
+    # The weights sync unit. A background reconciler, not part of the deploy:
+    # it runs at boot and whenever halogen-flash-weights.path sees the declared
+    # intent change, and exits immediately when nothing changed. Its generated
+    # text must not depend on the revision -- see the description below.
+    (lib.mkIf (cfg.enable && versionedActive) {
+      # The declared intent. Written on every activation; its bytes change only
+      # when the pinned revision is bumped, so a no-change deploy fires nothing.
+      # environment.etc (not tmpfiles) because it renames into place atomically
+      # and always exists after activation, which is what PathChanged needs.
+      environment.etc."halogen-flash/target-revision".text = "${targetRevision}\n";
+    })
     (lib.mkIf (cfg.enable && versionedActive) {
       systemd.services."halogen-flash-weights" = {
-        description = "Sync halogen-flash weights to ${targetRevision}";
+        # Constant on purpose. switch-to-configuration restarts units whose
+        # generated text changed, so naming the revision here would stop the
+        # fetch unit on every bump and hold the server behind it. The revision
+        # is read from /etc/halogen-flash/target-revision at run time instead.
+        description = "Sync halogen-flash weights to the declared revision";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "oneshot";
-          RemainAfterExit = true;
+          # RemainAfterExit deliberately NOT set: a PathUnit activates this unit
+          # with StartUnit, and starting an already-active RemainAfterExit oneshot
+          # is a no-op -- the second bump would silently do nothing. Leaving the
+          # unit inactive after a run is what makes repeat bumps work. Nothing
+          # orders off this unit any more, so nothing needs it to stay active.
           # root, not cfg.user: the unit restarts the server units after
           # flipping the symlink, which a non-root user cannot do.
           User = "root";
@@ -719,10 +846,32 @@ in
           # so pruning a version never throws away resumable metadata.
           Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
           ExecStart = weightsSyncScript;
-          # A revision bump is a fresh ~118 GiB transfer.
+          # A revision bump is a fresh ~112 GiB transfer.
           TimeoutStartSec = "2d";
           Restart = "on-failure";
           RestartSec = "60";
+        };
+        # StartLimit* is a [Unit] directive, not a [Service] one. NixOS renders
+        # serviceConfig into [Service], where systemd ignores unknown keys with a
+        # warning, so declaring them there silently loses the bound: the manager
+        # defaults (5 starts in 10 s) never trip against RestartSec=60 and a
+        # permanently failing fetch churns forever instead of settling `failed`.
+        unitConfig = {
+          # Bounded: the fetch is no longer a deploy, so a permanently failing
+          # download must settle in a visible `failed` state rather than churn
+          # forever. Five attempts in an hour rides out an HF blip.
+          StartLimitBurst = 5;
+          StartLimitIntervalSec = 3600;
+        };
+      };
+
+      # The trigger. The deploy only rewrites the intent file; this notices.
+      systemd.paths."halogen-flash-weights" = {
+        description = "Watch the declared halogen-flash weights revision";
+        wantedBy = [ "multi-user.target" ];
+        pathConfig = {
+          PathChanged = "/etc/halogen-flash/target-revision";
+          Unit = "halogen-flash-weights.service";
         };
       };
     })
