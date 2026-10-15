@@ -130,8 +130,28 @@ let
       active="$(basename "$(readlink "$currentLink")")"
     fi
 
+    textfileDir=${lib.escapeShellArg cfg.metricsTextfileDir}
+    write_metric() {
+      # Empty dir means metrics disabled on this host.
+      [ -n "$textfileDir" ] || return 0
+      mkdir -p "$textfileDir"
+      {
+        printf 'halogen_weights_desired_revision_info{revision="%s"} 1\n' "$revision"
+        printf 'halogen_weights_current_revision_info{revision="%s"} 1\n' "''${active:-none}"
+        printf 'halogen_weights_state{state="%s"} 1\n' "$1"
+      } > "$textfileDir/halogen-weights.prom.tmp.$$"
+      mv "$textfileDir/halogen-weights.prom.tmp.$$" "$textfileDir/halogen-weights.prom"
+    }
+
+    # Any exit that is not an explicit success below is a failure worth
+    # publishing: disk full, hf 5xx, network down. The success paths clear the
+    # trap so they are not overwritten with `failed` on the way out.
+    trap 'write_metric failed' EXIT
+
     if [ "$active" = "$revision" ] && [ -d "$targetDir" ]; then
       echo "halogen-weights: revision $revision already active, nothing to do"
+      trap - EXIT
+      write_metric complete
       exit 0
     fi
 
@@ -171,6 +191,8 @@ let
         read -r firstLine < "$markerFile"
         if [ "$firstLine" = "$expectedMarker" ]; then
           echo "halogen-weights: $targetDir complete (rev=$revision, excl=$exclusionsStr), nothing to do"
+          trap - EXIT
+          write_metric complete
           exit 0
         else
           echo "halogen-weights: $targetDir exists but exclusions/revision changed; will fetch (resumes from existing files)"
@@ -182,10 +204,13 @@ let
         # previously absent can be added now without deleting anything.
         echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=$revision)"
         echo "$expectedMarker" > "$markerFile"
+        trap - EXIT
+        write_metric complete
         exit 0
       fi
     fi
 
+    write_metric fetching
     echo "halogen-weights: fetching $repo @ $revision into $targetDir"
     "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" "''${excludeFlags[@]}"
 
@@ -203,6 +228,8 @@ let
     ln -s "$targetDir" "$tmpLink"
     mv -T "$tmpLink" "$currentLink"
     echo "halogen-weights: $currentLink -> $targetDir"
+    trap - EXIT
+    write_metric complete
 
     # The new tree is on disk and linked; now it is safe to move the server
     # onto it. try-restart so a host that has the unit masked does not fail
@@ -660,6 +687,23 @@ in
 
         When disabled, provision the directory yourself (`hf download ...
         --local-dir <modelsDir>` by hand) — a plain `test -d` runs instead.
+      '';
+    };
+
+    metricsTextfileDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/var/lib/node-exporter/textfiles";
+      example = "";
+      description = ''
+        Directory for the `halogen-weights.prom` node_exporter textfile, or ""
+        to disable metric emission. The sync unit records the desired revision,
+        the live revision, and its own state there at every transition.
+
+        This exists because a decoupled fetch can fail long after the deploy
+        that requested it reported success; without this the failure is
+        invisible to monitoring. The directory must be one node_exporter
+        actually reads -- enabling the textfile collector is the host's job,
+        not this module's.
       '';
     };
 
