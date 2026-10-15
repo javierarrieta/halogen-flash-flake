@@ -384,12 +384,11 @@ let
       # when the pinned artifact is already local, so this does not make
       # boot contingent on the registry being reachable.
       (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ])
-      # On a fresh boot wait for the weights oneshot to finish (a oneshot
-      # only reaches "started" once ExecStart exits 0), so the server does
-      # not crash-loop against a tree that is still downloading. Deliberately
-      # After= only, never Requires=: Requires would propagate a restart of
-      # the sync unit into the server every time it merely re-ran.
-      ++ (lib.optionals versionedActive [ "halogen-flash-weights.service" ])
+      # No edge on halogen-flash-weights.service: the fetch is a background
+      # reconciler now, and ordering here would let a multi-hour download delay
+      # a server restart. ExecStartPre's `test -d` is the only guard -- on a
+      # fresh host with no weights the unit fails loudly and retries, which is
+      # the same contract the pull unit has for a missing image.
       ++ (lib.optionals (cfg.download.enable && !versionedActive) [ "network-online.target" ])
       # split mode: don't race the engine to boot; its weight load takes
       # minutes and an API that starts first crash-loops until it is ready.
@@ -710,11 +709,10 @@ in
     (lib.mkIf (cfg.enable && cfg.mode == "all") {
       systemd.services."halogen-flash" = mkRoleUnit "all";
     })
-    # The weights sync unit. Wanted by multi-user.target and NOT Required by
-    # the server units: it runs on boot and on every switch whose revision
-    # differs, and exits immediately when nothing changed. Keeping it out of
-    # the server's Requires= means re-running it never propagates a restart
-    # into a healthy server.
+    # The weights sync unit. A background reconciler, not part of the deploy:
+    # it runs at boot and whenever halogen-flash-weights.path sees the declared
+    # intent change, and exits immediately when nothing changed. Its generated
+    # text must not depend on the revision -- see the description below.
     (lib.mkIf (cfg.enable && versionedActive) {
       # The declared intent. Written on every activation; its bytes change only
       # when the pinned revision is bumped, so a no-change deploy fires nothing.
@@ -724,13 +722,21 @@ in
     })
     (lib.mkIf (cfg.enable && versionedActive) {
       systemd.services."halogen-flash-weights" = {
-        description = "Sync halogen-flash weights to ${targetRevision}";
+        # Constant on purpose. switch-to-configuration restarts units whose
+        # generated text changed, so naming the revision here would stop the
+        # fetch unit on every bump and hold the server behind it. The revision
+        # is read from /etc/halogen-flash/target-revision at run time instead.
+        description = "Sync halogen-flash weights to the declared revision";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         serviceConfig = {
           Type = "oneshot";
-          RemainAfterExit = true;
+          # RemainAfterExit deliberately NOT set: a PathUnit activates this unit
+          # with StartUnit, and starting an already-active RemainAfterExit oneshot
+          # is a no-op -- the second bump would silently do nothing. Leaving the
+          # unit inactive after a run is what makes repeat bumps work. Nothing
+          # orders off this unit any more, so nothing needs it to stay active.
           # root, not cfg.user: the unit restarts the server units after
           # flipping the symlink, which a non-root user cannot do.
           User = "root";
@@ -738,10 +744,25 @@ in
           # so pruning a version never throws away resumable metadata.
           Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
           ExecStart = weightsSyncScript;
-          # A revision bump is a fresh ~118 GiB transfer.
+          # A revision bump is a fresh ~112 GiB transfer.
           TimeoutStartSec = "2d";
           Restart = "on-failure";
           RestartSec = "60";
+          # Bounded: the fetch is no longer a deploy, so a permanently failing
+          # download must settle in a visible `failed` state rather than churn
+          # forever. Five attempts in an hour rides out an HF blip.
+          StartLimitBurst = 5;
+          StartLimitIntervalSec = 3600;
+        };
+      };
+
+      # The trigger. The deploy only rewrites the intent file; this notices.
+      systemd.paths."halogen-flash-weights" = {
+        description = "Watch the declared halogen-flash weights revision";
+        wantedBy = [ "multi-user.target" ];
+        pathConfig = {
+          PathChanged = "/etc/halogen-flash/target-revision";
+          Unit = "halogen-flash-weights.service";
         };
       };
     })
