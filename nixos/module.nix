@@ -106,7 +106,7 @@ let
     excludeArgs=( ${lib.escapeShellArgs cfg.download.exclude} )
     excludeFlags=()
     for _p in "''${excludeArgs[@]}"; do excludeFlags+=( --exclude "$_p" ); done
-    exclusionsStr=${lib.concatStringsSep "|" cfg.download.exclude}
+    exclusionsStr=${lib.escapeShellArg (lib.concatStringsSep "|" cfg.download.exclude)}
 
     mkdir -p "$versionsDir"
 
@@ -597,16 +597,27 @@ in
           };
           options.exclude = lib.mkOption {
             type = lib.types.listOf lib.types.str;
-            default = [ ];
+            # Default matches `defaultRepo`'s unused checkpoints, so a weights
+            # bump fits the ~330 GiB volume without pulling the whole 286 GiB
+            # repo. Measured at aec9e43: these skip 173.9 GiB (w4b.hgn 115.5,
+            # ht43.hgn 53.7, w4b.overlay 2.4, w4b.overlay-speed 2.3) and keep
+            # the 112.1 GiB the engine needs (v2 + ngram + mtp + vision +
+            # tokenizer). This is a curated DENYLIST, not a required-only
+            # filter: on a weights bump, re-check the repo tree and extend it
+            # if the new revision adds another large unused checkpoint. Override
+            # per host (or set [ ] to fetch everything) if you want a different
+            # set; the patterns are harmless against a non-matching repo.
+            default = [
+              "qwen38-flash-next-w4b*"
+              "qwen38-flash-next-ht43*"
+            ];
             description = ''
               Glob patterns passed to `hf download --exclude`, naming files in the
-              weights repo that must never be fetched. Used to skip large
-              unused checkpoints (`w4b` at 116 GiB, `ht43` at 54 GiB) so a bump
-              fits the ~330 GiB volume without pulling 286 GiB. Patterns apply
-              against file paths in the repo (`fnmatch`), not the mounted tree.
-              The module records the exclusions in the fetch-completion marker,
-              so changing them forces a fresh download of anything previously
-              excluded; nothing is deleted.
+              weights repo that must never be fetched. Patterns apply against file
+              paths in the repo (`fnmatch`), not the mounted tree. The module
+              records the exclusions in the fetch-completion marker, so changing
+              them forces a fresh download of anything previously excluded; nothing
+              is deleted.
             '';
           };
         }
