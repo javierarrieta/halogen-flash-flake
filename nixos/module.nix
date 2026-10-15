@@ -94,6 +94,8 @@ let
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
     systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
+    excludePatterns=${lib.escapeShellArgs (map (e: "--exclude '" + e + "'") cfg.download.exclude)}
+    exclusionsStr=${lib.concatStringsSep "|" cfg.download.exclude}
 
     mkdir -p "$versionsDir"
 
@@ -139,12 +141,37 @@ let
       fi
     done
 
+    markerFile="$targetDir/.halogen-weights-complete"
+    expectedMarker="rev=${revision}|excl=${exclusionsStr}"
     if [ -d "$targetDir" ]; then
-      echo "halogen-weights: $targetDir already on disk, skipping fetch"
-    else
-      echo "halogen-weights: fetching $repo @ $revision into $targetDir"
-      "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir"
+      if [ -f "$markerFile" ]; then
+        read -r firstLine < "$markerFile"
+        if [ "$firstLine" = "$expectedMarker" ]; then
+          echo "halogen-weights: $targetDir complete (rev=${revision}, excl=${exclusionsStr:-none}), nothing to do"
+          exit 0
+        else
+          echo "halogen-weights: $targetDir exists but exclusions/revision changed; will fetch (resumes from existing files)"
+        fi
+      else
+        # Legacy / interrupted tree with no marker: adopt it (write marker)
+        # rather than re-fetching a complete tree. A missing file in the tree
+        # is handled by hf download (re-verifies); only exclusions that were
+        # previously absent can be added now without deleting anything.
+        echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=${revision})"
+        echo "$expectedMarker" > "$markerFile"
+        exit 0
+      fi
     fi
+
+    echo "halogen-weights: fetching $repo @ $revision into $targetDir"
+    "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" $excludePatterns
+
+    # Write the completion marker immediately after the fetch succeeds,
+    # before the symlink flip. This means a failed/superseded fetch (e.g.
+    # disk full, interrupted download with partial dir) never writes the
+    # marker, so the next run sees the partial and resumes (re-fetches the
+    # missing pieces) rather than trusting an incomplete tree.
+    echo "$expectedMarker" > "$markerFile"
 
     # Atomic swap. `ln -sf` onto an existing symlink-to-a-directory follows
     # the link and creates the new one INSIDE it; rename(2) over the link
@@ -188,7 +215,11 @@ let
       # Do not mirror shipped defaults here — when the image changes, a stale
       # override silently wins (upstream's own words on their compose file).
       extraEnv = (lib.optionalAttrs cfg.enableVision {
-        HALOGEN_VISION_TOWER = "${mountSource}/qwen38-flash-next-vision.hgn";
+        # `1` tells the engine to look for the vision sidecar beside the
+        # checkpoint inside the container's `/models` mount (i.e. the same
+        # mount source that `current` points to). A raw host absolute path
+        # (`${mountSource}/...`) does not exist inside the container namespace.
+        HALOGEN_VISION_TOWER = "1";
       })
       // cfg.environment;
     in
@@ -526,6 +557,20 @@ in
 
             Set false for the original behaviour (fetch into `modelsDir` in
             the role unit's ExecStartPre, which blocks startup).
+          '';
+        };
+        options.exclude = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = ''
+            Glob patterns passed to `hf download --exclude`, naming files in the
+            weights repo that must never be fetched. Used to skip large
+            unused checkpoints (`w4b` at 116 GiB, `ht43` at 54 GiB) so a bump
+            fits the ~330 GiB volume without pulling 286 GiB. Patterns apply
+            against file paths in the repo (`fnmatch`), not the mounted tree.
+            The module records the exclusions in the fetch-completion marker,
+            so changing them forces a fresh download of anything previously
+            excluded; nothing is deleted.
           '';
         };
       });
