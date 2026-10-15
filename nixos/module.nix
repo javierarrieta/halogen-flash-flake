@@ -31,7 +31,12 @@
 # Disk is capped at TWO versions: the sync unit prunes every version dir that
 # is not the live one before it starts a fetch, so a revision bump never needs
 # room for three.
-{ lib, pkgs, config, ... }:
+{
+  lib,
+  pkgs,
+  config,
+  ...
+}:
 
 let
   cfg = config.services.halogenFlash;
@@ -52,8 +57,7 @@ let
   # must be the system's setuid wrappers. virtualisation.podman.package is
   # exactly that (it bakes /run/wrappers into the helper lookup — same store
   # path as the host's own podman when it is enabled, so no rebuild).
-  podmanPkg =
-    if cfg.user != "root" then config.virtualisation.podman.package else pkgs.podman;
+  podmanPkg = if cfg.user != "root" then config.virtualisation.podman.package else pkgs.podman;
 
   # The versioned layout only exists when the module is the one fetching. With
   # downloads off the operator owns modelsDir outright, so mount it directly
@@ -62,7 +66,8 @@ let
 
   versionsDir = "${cfg.modelsDir}/versions";
   currentLink = "${cfg.modelsDir}/current";
-  targetRevision = if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
+  targetRevision =
+    if cfg.download.revision != "" then cfg.download.revision else defaultWeightsRevision;
   targetDir = "${versionsDir}/${targetRevision}";
 
   # What the container actually mounts as /models. Constant under the
@@ -73,10 +78,14 @@ let
   # Units that read the weights tree, and therefore have to be restarted when
   # the symlink flips. Names are spelled out rather than derived from mkRoleUnit
   # so the restart target is obvious in the generated unit.
-  roleUnitNames = if cfg.mode == "all" then [ "halogen-flash" ] else [
-    "halogen-flash-engine"
-    "halogen-flash-api"
-  ];
+  roleUnitNames =
+    if cfg.mode == "all" then
+      [ "halogen-flash" ]
+    else
+      [
+        "halogen-flash-engine"
+        "halogen-flash-api"
+      ];
 
   # Fetch the pinned revision, prune what it displaced, then move the server
   # onto it. Runs as root: it must be able to restart the server units, and
@@ -94,6 +103,10 @@ let
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
     systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
+    excludeArgs=( ${lib.escapeShellArgs cfg.download.exclude} )
+    excludeFlags=()
+    for _p in "''${excludeArgs[@]}"; do excludeFlags+=( --exclude "$_p" ); done
+    exclusionsStr=${lib.concatStringsSep "|" cfg.download.exclude}
 
     mkdir -p "$versionsDir"
 
@@ -139,12 +152,37 @@ let
       fi
     done
 
+    markerFile="$targetDir/.halogen-weights-complete"
+    expectedMarker="rev=$revision|excl=$exclusionsStr"
     if [ -d "$targetDir" ]; then
-      echo "halogen-weights: $targetDir already on disk, skipping fetch"
-    else
-      echo "halogen-weights: fetching $repo @ $revision into $targetDir"
-      "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir"
+      if [ -f "$markerFile" ]; then
+        read -r firstLine < "$markerFile"
+        if [ "$firstLine" = "$expectedMarker" ]; then
+          echo "halogen-weights: $targetDir complete (rev=$revision, excl=$exclusionsStr), nothing to do"
+          exit 0
+        else
+          echo "halogen-weights: $targetDir exists but exclusions/revision changed; will fetch (resumes from existing files)"
+        fi
+      else
+        # Legacy / interrupted tree with no marker: adopt it (write marker)
+        # rather than re-fetching a complete tree. A missing file in the tree
+        # is handled by hf download (re-verifies); only exclusions that were
+        # previously absent can be added now without deleting anything.
+        echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=$revision)"
+        echo "$expectedMarker" > "$markerFile"
+        exit 0
+      fi
     fi
+
+    echo "halogen-weights: fetching $repo @ $revision into $targetDir"
+    "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" "''${excludeFlags[@]}"
+
+    # Write the completion marker immediately after the fetch succeeds,
+    # before the symlink flip. This means a failed/superseded fetch (e.g.
+    # disk full, interrupted download with partial dir) never writes the
+    # marker, so the next run sees the partial and resumes (re-fetches the
+    # missing pieces) rather than trusting an incomplete tree.
+    echo "$expectedMarker" > "$markerFile"
 
     # Atomic swap. `ln -sf` onto an existing symlink-to-a-directory follows
     # the link and creates the new one INSIDE it; rename(2) over the link
@@ -176,21 +214,26 @@ let
       # `revision` set, hf fetches that exact commit instead of the floating
       # default branch.
       let
-        revArg = lib.optionalString (cfg.download.revision != "")
-          " --revision '${cfg.download.revision}'";
+        revArg = lib.optionalString (cfg.download.revision != "") " --revision '${cfg.download.revision}'";
       in
       "${pkgs.python3Packages.huggingface-hub}/bin/hf download ${cfg.download.repo}${revArg} --local-dir '${cfg.modelsDir}'"
     else
       "${pkgs.coreutils}/bin/test -d '${cfg.modelsDir}'";
 
-  roleArgs = roleName:
+  roleArgs =
+    roleName:
     let
       # Do not mirror shipped defaults here — when the image changes, a stale
       # override silently wins (upstream's own words on their compose file).
-      extraEnv = (lib.optionalAttrs cfg.enableVision {
-        HALOGEN_VISION_TOWER = "${mountSource}/qwen38-flash-next-vision.hgn";
-      })
-      // cfg.environment;
+      extraEnv =
+        (lib.optionalAttrs cfg.enableVision {
+          # `1` tells the engine to look for the vision sidecar beside the
+          # checkpoint inside the container's `/models` mount (i.e. the same
+          # mount source that `current` points to). A raw host absolute path
+          # (`${mountSource}/...`) does not exist inside the container namespace.
+          HALOGEN_VISION_TOWER = "1";
+        })
+        // cfg.environment;
     in
     [
       "--name"
@@ -231,8 +274,14 @@ let
     # which binds -p forwards only on loopback + the pasta interface — a LAN
     # client then gets timeouts even with the firewall port open.
     ++ [ "--network=host" ]
-    ++ (lib.optionals (cfg.mode == "split" && roleName == "api") [ "-e" "HALOGEN_ENGINE=127.0.0.1:${toString cfg.enginePort}" ])
-    ++ lib.concatMap (k: [ "-e" "${k}=${extraEnv.${k}}" ]) (lib.attrNames extraEnv)
+    ++ (lib.optionals (cfg.mode == "split" && roleName == "api") [
+      "-e"
+      "HALOGEN_ENGINE=127.0.0.1:${toString cfg.enginePort}"
+    ])
+    ++ lib.concatMap (k: [
+      "-e"
+      "${k}=${extraEnv.${k}}"
+    ]) (lib.attrNames extraEnv)
     # raw pass-through, appended last so it can override anything above
     ++ cfg.extraRunArgs;
 
@@ -242,8 +291,10 @@ let
   # for this, so keep a local one.
   sysdArg =
     a:
-    if builtins.match "[A-Za-z0-9_@+=:,./-]*" a != null then a
-    else "\"${lib.replaceStrings [ "\\" "\"" "%" ] [ "\\\\" "\\\"" "%%" ] a}\"";
+    if builtins.match "[A-Za-z0-9_@+=:,./-]*" a != null then
+      a
+    else
+      "\"${lib.replaceStrings [ "\\" "\"" "%" ] [ "\\\\" "\\\"" "%%" ] a}\"";
 
   # A digest-pinned reference (name:tag@sha256:...) names immutable bytes;
   # a bare tag does not. Split the two so the pull unit can verify local
@@ -254,19 +305,26 @@ let
       parts = builtins.match "(.*)@(sha256:[0-9a-f]{64})" cfg.image;
     in
     if parts != null then
-      { ref = builtins.elemAt parts 0; digest = builtins.elemAt parts 1; }
+      {
+        ref = builtins.elemAt parts 0;
+        digest = builtins.elemAt parts 1;
+      }
     else
-      { ref = cfg.image; digest = ""; };
+      {
+        ref = cfg.image;
+        digest = "";
+      };
 
   # Shared by the role units and the pull unit. Rootless podman needs $HOME
   # (its storage lives under it) and XDG_RUNTIME_DIR (systemd sets neither
   # for system units with User=); root runs need neither.
-  unitEnvironment =
-    [ "HF_HOME=${cfg.modelsDir}/.cache" ]
-    ++ lib.optionals (cfg.user != "root") [
-      "HOME=${cfg.podmanHome}"
-      "XDG_RUNTIME_DIR=/run/user/${toString config.users.users.${cfg.user}.uid}"
-    ];
+  unitEnvironment = [
+    "HF_HOME=${cfg.modelsDir}/.cache"
+  ]
+  ++ lib.optionals (cfg.user != "root") [
+    "HOME=${cfg.podmanHome}"
+    "XDG_RUNTIME_DIR=/run/user/${toString config.users.users.${cfg.user}.uid}"
+  ];
 
   # Pull the pinned image, but never let a dead registry take the server
   # down. If the pull fails and the exact artifact is already in local
@@ -354,7 +412,10 @@ let
       # for a shell, producing one-argv "--name foo".)
       ExecStart =
         let
-          argv = roleArgs roleName ++ [ cfg.image roleName ];
+          argv = roleArgs roleName ++ [
+            cfg.image
+            roleName
+          ];
         in
         "${podmanPkg}/bin/podman run ${lib.concatMapStringsSep " " sysdArg argv}";
     };
@@ -424,7 +485,9 @@ in
           a oneshot unit that pulls the image before the server units start
         '';
       };
-      default = { enable = false; };
+      default = {
+        enable = false;
+      };
       description = ''
         When enabled, `halogen-flash-pull.service` runs before the role
         units and pulls `image` as `user` — which matters for rootless
@@ -443,7 +506,10 @@ in
     };
 
     mode = lib.mkOption {
-      type = lib.types.enum [ "all" "split" ];
+      type = lib.types.enum [
+        "all"
+        "split"
+      ];
       default = "all";
       description = ''
         all: one container running engine + OpenAI front-end (the upstream
@@ -484,51 +550,67 @@ in
     };
 
     download = lib.mkOption {
-      type = lib.types.submodule ({ ... }: rec {
-        options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub before each start";
-        options.repo = lib.mkOption {
-          type = lib.types.str;
-          default = defaultRepo;
-          description = "HuggingFace repo id: ~115 GiB checkpoint, quality sidecar and tokenizer.";
-        };
-        options.revision = lib.mkOption {
-          type = lib.types.str;
-          default = defaultWeightsRevision;
-          example = "cd24312f5c5e671659f538ed1f489120c658901f";
-          description = ''
-            HuggingFace commit sha to pin the weights to. Defaults to
-            `defaultWeightsRevision` above so the weights are as immutable as
-            the image. Setting it to "" means the repo's default branch,
-            which floats: an upstream push would swap the model underneath a
-            digest-pinned image with no review and no rollback path, and may
-            not even match what that image expects.
-          '';
-        };
-        options.toVersionedDir = lib.mkOption {
-          type = lib.types.bool;
-          default = true;
-          description = ''
-            Fetch into `<modelsDir>/versions/<revision>/` and point
-            `<modelsDir>/current` at the live revision, instead of pulling
-            straight into `modelsDir`.
+      type = lib.types.submodule (
+        { ... }: rec {
+          options.enable = lib.mkEnableOption "fetching the weights with huggingface-hub before each start";
+          options.repo = lib.mkOption {
+            type = lib.types.str;
+            default = defaultRepo;
+            description = "HuggingFace repo id: ~115 GiB checkpoint, quality sidecar and tokenizer.";
+          };
+          options.revision = lib.mkOption {
+            type = lib.types.str;
+            default = defaultWeightsRevision;
+            example = "cd24312f5c5e671659f538ed1f489120c658901f";
+            description = ''
+              HuggingFace commit sha to pin the weights to. Defaults to
+              `defaultWeightsRevision` above so the weights are as immutable as
+              the image. Setting it to "" means the repo's default branch,
+              which floats: an upstream push would swap the model underneath a
+              digest-pinned image with no review and no rollback path, and may
+              not even match what that image expects.
+            '';
+          };
+          options.toVersionedDir = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = ''
+              Fetch into `<modelsDir>/versions/<revision>/` and point
+              `<modelsDir>/current` at the live revision, instead of pulling
+              straight into `modelsDir`.
 
-            Because the units mount `current`, a revision bump no longer
-            changes the server units at all: `halogen-flash-weights.service`
-            downloads the new tree while the old server keeps serving, flips
-            the symlink, and only then restarts the server to load it. The
-            window where the server is down is the weight load (minutes), not
-            the ~118 GiB transfer (hours).
+              Because the units mount `current`, a revision bump no longer
+              changes the server units at all: `halogen-flash-weights.service`
+              downloads the new tree while the old server keeps serving, flips
+              the symlink, and only then restarts the server to load it. The
+              window where the server is down is the weight load (minutes), not
+              the ~118 GiB transfer (hours).
 
-            Superseded versions are pruned BEFORE each fetch, so the volume
-            only ever needs room for two: the live tree and the one being
-            fetched. Roll back by pointing `current` at the older tree and
-            restarting.
+              Superseded versions are pruned BEFORE each fetch, so the volume
+              only ever needs room for two: the live tree and the one being
+              fetched. Roll back by pointing `current` at the older tree and
+              restarting.
 
-            Set false for the original behaviour (fetch into `modelsDir` in
-            the role unit's ExecStartPre, which blocks startup).
-          '';
-        };
-      });
+              Set false for the original behaviour (fetch into `modelsDir` in
+              the role unit's ExecStartPre, which blocks startup).
+            '';
+          };
+          options.exclude = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            description = ''
+              Glob patterns passed to `hf download --exclude`, naming files in the
+              weights repo that must never be fetched. Used to skip large
+              unused checkpoints (`w4b` at 116 GiB, `ht43` at 54 GiB) so a bump
+              fits the ~330 GiB volume without pulling 286 GiB. Patterns apply
+              against file paths in the repo (`fnmatch`), not the mounted tree.
+              The module records the exclusions in the fetch-completion marker,
+              so changing them forces a fresh download of anything previously
+              excluded; nothing is deleted.
+            '';
+          };
+        }
+      );
       default = {
         enable = false;
         repo = defaultRepo;
@@ -598,136 +680,125 @@ in
   # GPU memory budget is host-wide: llm01's GTT (~112–120 GiB) is a single
   # pool shared with whatever else the iGPU holds (llama-cpp-server), so this
   # and that are mutually exclusive — run one or the other at a time.
-  config =
-    lib.mkMerge ([
-      # Explicit unit names (no mapAttrsToList over dynamic keys): keeps the
-      # merge plain attrsets, which is what the current NixOS module system
-      # handles without trouble.
-      (
-        lib.mkIf (cfg.enable && cfg.mode == "all") {
-          systemd.services."halogen-flash" = mkRoleUnit "all";
-        }
-      )
-      # The weights sync unit. Wanted by multi-user.target and NOT Required by
-      # the server units: it runs on boot and on every switch whose revision
-      # differs, and exits immediately when nothing changed. Keeping it out of
-      # the server's Requires= means re-running it never propagates a restart
-      # into a healthy server.
-      (
-        lib.mkIf (cfg.enable && versionedActive) {
-          systemd.services."halogen-flash-weights" = {
-            description = "Sync halogen-flash weights to ${targetRevision}";
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network-online.target" ];
-            wants = [ "network-online.target" ];
-            serviceConfig = {
-              Type = "oneshot";
-              RemainAfterExit = true;
-              # root, not cfg.user: the unit restarts the server units after
-              # flipping the symlink, which a non-root user cannot do.
-              User = "root";
-              # Same hub cache location the role units use, under the BASE dir
-              # so pruning a version never throws away resumable metadata.
-              Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
-              ExecStart = weightsSyncScript;
-              # A revision bump is a fresh ~118 GiB transfer.
-              TimeoutStartSec = "2d";
-              Restart = "on-failure";
-              RestartSec = "60";
-            };
-          };
-        }
-      )
-      (
-        lib.mkIf (cfg.enable && cfg.pull.enable) {
-          systemd.services."halogen-flash-pull" = {
-            description = "Pull the halogen-flash-server image";
-            wantedBy = [ "multi-user.target" ];
-            after = [ "network-online.target" ];
-            wants = [ "network-online.target" ];
-            serviceConfig = {
-              Type = "oneshot";
-              RemainAfterExit = true;
-              # Same user as the role units: rootless podman stores the image
-              # per-user, so pulling as anyone else is useless here.
-              User = cfg.user;
-              Environment = unitEnvironment ++ [
-                "HALOGEN_IMAGE=${cfg.image}"
-                "HALOGEN_DIGEST=${imageParts.digest}"
-              ];
-              ExecStart = "${pkgs.writeShellScript "halogen-flash-pull" pullScript}";
-              # The image is the engine + front-end only (a few GiB); the
-              # ~118 GiB of weights are a separate volume and untouched
-              # here. Generous, but bounded well below the weight-fetch
-              # timeout on the sync unit.
-              TimeoutStartSec = "30min";
-            };
-          };
-        }
-      )
-      (
-        lib.mkIf (cfg.enable && cfg.mode == "split") {
-          systemd.services."halogen-flash-engine" = mkRoleUnit "engine";
-          systemd.services."halogen-flash-api" = mkRoleUnit "api";
-        }
-      )
-      (
-        lib.mkIf (cfg.enable && cfg.pull.enable && imageParts.digest == "") {
-          warnings = [
-            ''
-              services.halogenFlash.pull is enabled but services.halogenFlash.image
-              (${cfg.image}) is not digest-pinned. The pull unit fetches a mutable
-              tag, so the container that starts is whatever the registry served at
-              that moment — not necessarily the release that was reviewed — and the
-              "already in local storage" fallback is a guess rather than a proof.
-              Pin it as `name:tag@sha256:<digest>` (scripts/bump-image.sh writes
-              this form) or disable the pull.''
+  config = lib.mkMerge ([
+    # Explicit unit names (no mapAttrsToList over dynamic keys): keeps the
+    # merge plain attrsets, which is what the current NixOS module system
+    # handles without trouble.
+    (lib.mkIf (cfg.enable && cfg.mode == "all") {
+      systemd.services."halogen-flash" = mkRoleUnit "all";
+    })
+    # The weights sync unit. Wanted by multi-user.target and NOT Required by
+    # the server units: it runs on boot and on every switch whose revision
+    # differs, and exits immediately when nothing changed. Keeping it out of
+    # the server's Requires= means re-running it never propagates a restart
+    # into a healthy server.
+    (lib.mkIf (cfg.enable && versionedActive) {
+      systemd.services."halogen-flash-weights" = {
+        description = "Sync halogen-flash weights to ${targetRevision}";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # root, not cfg.user: the unit restarts the server units after
+          # flipping the symlink, which a non-root user cannot do.
+          User = "root";
+          # Same hub cache location the role units use, under the BASE dir
+          # so pruning a version never throws away resumable metadata.
+          Environment = [ "HF_HOME=${cfg.modelsDir}/.cache" ];
+          ExecStart = weightsSyncScript;
+          # A revision bump is a fresh ~118 GiB transfer.
+          TimeoutStartSec = "2d";
+          Restart = "on-failure";
+          RestartSec = "60";
+        };
+      };
+    })
+    (lib.mkIf (cfg.enable && cfg.pull.enable) {
+      systemd.services."halogen-flash-pull" = {
+        description = "Pull the halogen-flash-server image";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # Same user as the role units: rootless podman stores the image
+          # per-user, so pulling as anyone else is useless here.
+          User = cfg.user;
+          Environment = unitEnvironment ++ [
+            "HALOGEN_IMAGE=${cfg.image}"
+            "HALOGEN_DIGEST=${imageParts.digest}"
           ];
-        }
-      )
-      # The published API port (the engine port is loopback-only, and
-      # loopback traffic does not traverse the firewall).
-      (lib.mkIf cfg.enable { networking.firewall.allowedTCPPorts = [ cfg.port]; })
-      # Rootless mode support: linger keeps /run/user/<uid> alive for podman,
-      # subuid/subgid ranges are REQUIRED by rootless podman (auto-allocation
-      # only defaults on for isNormalUser — a system user like ollama needs
-      # this), and tmpfiles gives the user ownership of its storage and the
-      # weights (Z also fixes ownership of a pre-fetched tree).
-      (
-        lib.mkIf (cfg.enable && cfg.user != "root") {
-          users.users.${cfg.user} = {
-            linger = true;
-            autoSubUidGidRange = true;
-          };
-          # Rootless podman with a subuid range execs newuidmap/newgidmap,
-          # which only work setuid-root. Define the wrappers here so hosts
-          # without virtualisation.podman (or programs.shadow) get them too;
-          # identical definitions merge cleanly with those modules'.
-          security.wrappers = {
-            newuidmap = {
-              setuid = true;
-              owner = "root";
-              group = "root";
-              source = "${pkgs.shadow}/bin/newuidmap";
-            };
-            newgidmap = {
-              setuid = true;
-              owner = "root";
-              group = "root";
-              source = "${pkgs.shadow}/bin/newgidmap";
-            };
-          };
-          systemd.tmpfiles.rules = [
-            # Guarantee the runtime dir exists before the first start — logind
-            # creates it for linger, but can race the unit on a fresh switch.
-            "d /run/user/${toString config.users.users.${cfg.user}.uid} 0700 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
-            "d ${cfg.podmanHome} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
-            # The base dir has to exist before the sync unit runs as root, and
-            # Z keeps a pre-fetched tree readable by the service user.
-            "d ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
-            "Z ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
-          ];
-        }
-      )
-    ]);
+          ExecStart = "${pkgs.writeShellScript "halogen-flash-pull" pullScript}";
+          # The image is the engine + front-end only (a few GiB); the
+          # ~118 GiB of weights are a separate volume and untouched
+          # here. Generous, but bounded well below the weight-fetch
+          # timeout on the sync unit.
+          TimeoutStartSec = "30min";
+        };
+      };
+    })
+    (lib.mkIf (cfg.enable && cfg.mode == "split") {
+      systemd.services."halogen-flash-engine" = mkRoleUnit "engine";
+      systemd.services."halogen-flash-api" = mkRoleUnit "api";
+    })
+    (lib.mkIf (cfg.enable && cfg.pull.enable && imageParts.digest == "") {
+      warnings = [
+        ''
+          services.halogenFlash.pull is enabled but services.halogenFlash.image
+          (${cfg.image}) is not digest-pinned. The pull unit fetches a mutable
+          tag, so the container that starts is whatever the registry served at
+          that moment — not necessarily the release that was reviewed — and the
+          "already in local storage" fallback is a guess rather than a proof.
+          Pin it as `name:tag@sha256:<digest>` (scripts/bump-image.sh writes
+          this form) or disable the pull.''
+      ];
+    })
+    # The published API port (the engine port is loopback-only, and
+    # loopback traffic does not traverse the firewall).
+    (lib.mkIf cfg.enable { networking.firewall.allowedTCPPorts = [ cfg.port ]; })
+    # Rootless mode support: linger keeps /run/user/<uid> alive for podman,
+    # subuid/subgid ranges are REQUIRED by rootless podman (auto-allocation
+    # only defaults on for isNormalUser — a system user like ollama needs
+    # this), and tmpfiles gives the user ownership of its storage and the
+    # weights (Z also fixes ownership of a pre-fetched tree).
+    (lib.mkIf (cfg.enable && cfg.user != "root") {
+      users.users.${cfg.user} = {
+        linger = true;
+        autoSubUidGidRange = true;
+      };
+      # Rootless podman with a subuid range execs newuidmap/newgidmap,
+      # which only work setuid-root. Define the wrappers here so hosts
+      # without virtualisation.podman (or programs.shadow) get them too;
+      # identical definitions merge cleanly with those modules'.
+      security.wrappers = {
+        newuidmap = {
+          setuid = true;
+          owner = "root";
+          group = "root";
+          source = "${pkgs.shadow}/bin/newuidmap";
+        };
+        newgidmap = {
+          setuid = true;
+          owner = "root";
+          group = "root";
+          source = "${pkgs.shadow}/bin/newgidmap";
+        };
+      };
+      systemd.tmpfiles.rules = [
+        # Guarantee the runtime dir exists before the first start — logind
+        # creates it for linger, but can race the unit on a fresh switch.
+        "d /run/user/${toString config.users.users.${cfg.user}.uid} 0700 ${cfg.user} ${
+          config.users.users.${cfg.user}.group
+        } - -"
+        "d ${cfg.podmanHome} 0750 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+        # The base dir has to exist before the sync unit runs as root, and
+        # Z keeps a pre-fetched tree readable by the service user.
+        "d ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+        "Z ${cfg.modelsDir} 0755 ${cfg.user} ${config.users.users.${cfg.user}.group} - -"
+      ];
+    })
+  ]);
 }
