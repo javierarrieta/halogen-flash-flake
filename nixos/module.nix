@@ -124,6 +124,25 @@ let
 
     mkdir -p "$versionsDir"
 
+    textfileDir=${lib.escapeShellArg cfg.metricsTextfileDir}
+    write_metric() {
+      # Empty dir means metrics disabled on this host.
+      [ -n "$textfileDir" ] || return 0
+      mkdir -p "$textfileDir"
+      {
+        printf 'halogen_weights_desired_revision_info{revision="%s"} 1\n' "''${revision:-unknown}"
+        printf 'halogen_weights_current_revision_info{revision="%s"} 1\n' "''${active:-none}"
+        printf 'halogen_weights_state{state="%s"} 1\n' "$1"
+      } > "$textfileDir/halogen-weights.prom.tmp.$$"
+      mv "$textfileDir/halogen-weights.prom.tmp.$$" "$textfileDir/halogen-weights.prom"
+    }
+
+    # Installed before anything can fail, so a failure that happens before the
+    # intent file is even readable still publishes `failed` instead of leaving a
+    # previous run's `complete` on the wire while the unit churns. The success
+    # paths below clear the trap so they are not overwritten on the way out.
+    trap 'write_metric failed' EXIT
+
     # The revision is run-time state, not build-time text: baking it into the
     # script made every bump rewrite the unit's ExecStart path, which is exactly
     # the restart we are trying to avoid.
@@ -145,24 +164,6 @@ let
     if [ -L "$currentLink" ]; then
       active="$(basename "$(readlink "$currentLink")")"
     fi
-
-    textfileDir=${lib.escapeShellArg cfg.metricsTextfileDir}
-    write_metric() {
-      # Empty dir means metrics disabled on this host.
-      [ -n "$textfileDir" ] || return 0
-      mkdir -p "$textfileDir"
-      {
-        printf 'halogen_weights_desired_revision_info{revision="%s"} 1\n' "$revision"
-        printf 'halogen_weights_current_revision_info{revision="%s"} 1\n' "''${active:-none}"
-        printf 'halogen_weights_state{state="%s"} 1\n' "$1"
-      } > "$textfileDir/halogen-weights.prom.tmp.$$"
-      mv "$textfileDir/halogen-weights.prom.tmp.$$" "$textfileDir/halogen-weights.prom"
-    }
-
-    # Any exit that is not an explicit success below is a failure worth
-    # publishing: disk full, hf 5xx, network down. The success paths clear the
-    # trap so they are not overwritten with `failed` on the way out.
-    trap 'write_metric failed' EXIT
 
     if [ "$active" = "$revision" ] && [ -d "$targetDir" ]; then
       echo "halogen-weights: revision $revision already active, nothing to do"
@@ -245,14 +246,42 @@ let
     mv -T "$tmpLink" "$currentLink"
     echo "halogen-weights: $currentLink -> $targetDir"
     trap - EXIT
-    write_metric complete
 
     # The new tree is on disk and linked; now it is safe to move the server
     # onto it. try-restart so a host that has the unit masked does not fail
     # the sync.
     if [ -n "$restartUnits" ]; then
       echo "halogen-weights: restarting $restartUnits to load $revision"
-      "$systemctl" try-restart $restartUnits
+      # The bump is only actually deployed once the server runs on the new tree.
+      # try-restart exits 0 even for a unit that fails to come back, so the
+      # outcome is checked rather than publishing `complete` over a dead server.
+      "$systemctl" try-restart $restartUnits || {
+        echo "halogen-weights: restart of $restartUnits failed" >&2
+        write_metric restart_failed
+        exit 1
+      }
+      for _u in $restartUnits; do
+        if ! "$systemctl" is-active --quiet "$_u"; then
+          echo "halogen-weights: $_u is not active after the restart" >&2
+          write_metric restart_failed
+          exit 1
+        fi
+      done
+    fi
+    write_metric complete
+
+    # A bump that landed while this fetch was running is not silently dropped.
+    # The path unit activates this service with StartUnit, which is a no-op while
+    # it is already activating, so without this the newer intent would not be
+    # picked up until the next change or a reboot. Exiting non-zero lets the
+    # restart policy run the reconciler against the new intent.
+    if [ -r "$targetRevisionFile" ]; then
+      _now="$(tr -d '[:space:]' < "$targetRevisionFile")"
+      if [ -n "$_now" ] && [ "$_now" != "$revision" ]; then
+        echo "halogen-weights: intent moved to $_now mid-run; requeueing" >&2
+        write_metric superseded
+        exit 1
+      fi
     fi
   '';
 
@@ -456,8 +485,12 @@ let
       # to User=, which is what makes the rootless podman run able to honor
       # it; without it podman exits immediately with EPERM as non-root.
       LimitMEMLOCK = "infinity";
-      # Weight reloads take minutes; give repeated load failures real room,
-      # but keep a crash-loop guard (5 starts in 30 s gives up).
+      # Weight reloads take minutes; give repeated load failures real room.
+      # No StartLimit* here on purpose: the manager default is 5 starts in 10 s,
+      # which RestartSec=30 never reaches, so a failed load keeps retrying until
+      # the weights unit flips `current` and restarts it. That unbounded retry is
+      # what lets a host that booted before its weights existed recover on its
+      # own once the fetch lands.
       Restart = "on-failure";
       RestartSec = "30";
       # systemd splits ExecStart itself (no shell): flag/value pairs stay
@@ -817,6 +850,13 @@ in
           TimeoutStartSec = "2d";
           Restart = "on-failure";
           RestartSec = "60";
+        };
+        # StartLimit* is a [Unit] directive, not a [Service] one. NixOS renders
+        # serviceConfig into [Service], where systemd ignores unknown keys with a
+        # warning, so declaring them there silently loses the bound: the manager
+        # defaults (5 starts in 10 s) never trip against RestartSec=60 and a
+        # permanently failing fetch churns forever instead of settling `failed`.
+        unitConfig = {
           # Bounded: the fetch is no longer a deploy, so a permanently failing
           # download must settle in a visible `failed` state rather than churn
           # forever. Five attempts in an hour rides out an HF blip.
