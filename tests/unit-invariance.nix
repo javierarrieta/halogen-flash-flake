@@ -33,18 +33,19 @@ let
   keys = builtins.attrNames svcCfg;
 in
 ''
-WEIGHTS_DESCRIPTION=${svc.description}
-WEIGHTS_AFTER=${toString (svc.after or [ ])}
-WEIGHTS_WANTS=${toString (svc.wants or [ ])}
-WEIGHTS_WANTEDBY=${toString (svc.wantedBy or [ ])}
-WEIGHTS_EXECSTART=${toString (svcCfg.ExecStart or "<none>")}
-${builtins.concatStringsSep "\n"
-  (map (k: "WEIGHTS_CFG_${k}=${toString svcCfg.${k}}") (builtins.sort builtins.lessThan keys))}
-PATH_DESCRIPTION=${path.description or "<none>"}
-PATH_UNIT=${toString (pathCfg.Unit or "<none>")}
-PATH_CHANGED=${toString (pathCfg.PathChanged or "<none>")}
-PATH_WANTEDBY=${toString (path.wantedBy or [ ])}
-ROLE_AFTER=${toString (role.after or [ ])}
-ROLE_EXECSTARTPRE=${toString (role.serviceConfig.ExecStartPre or [ ])}
-ETC_TARGET=${ev.config.environment.etc."halogen-flash/target-revision".text or "<none>"}
+  WEIGHTS_DESCRIPTION=${svc.description}
+  WEIGHTS_AFTER=${toString (svc.after or [ ])}
+  WEIGHTS_WANTS=${toString (svc.wants or [ ])}
+  WEIGHTS_WANTEDBY=${toString (svc.wantedBy or [ ])}
+  WEIGHTS_EXECSTART=${toString (svcCfg.ExecStart or "<none>")}
+  ${builtins.concatStringsSep "\n" (
+    map (k: "WEIGHTS_CFG_${k}=${toString svcCfg.${k}}") (builtins.sort builtins.lessThan keys)
+  )}
+  PATH_DESCRIPTION=${path.description or "<none>"}
+  PATH_UNIT=${toString (pathCfg.Unit or "<none>")}
+  PATH_CHANGED=${toString (pathCfg.PathChanged or "<none>")}
+  PATH_WANTEDBY=${toString (path.wantedBy or [ ])}
+  ROLE_AFTER=${toString (role.after or [ ])}
+  ROLE_EXECSTARTPRE=${toString (role.serviceConfig.ExecStartPre or [ ])}
+  ETC_TARGET=${ev.config.environment.etc."halogen-flash/target-revision".text or "<none>"}
 ''
