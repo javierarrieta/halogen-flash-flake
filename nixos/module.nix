@@ -103,7 +103,9 @@ let
     hf=${pkgs.python3Packages.huggingface-hub}/bin/hf
     systemctl=${pkgs.systemd}/bin/systemctl
     restartUnits=${lib.escapeShellArg (lib.concatMapStringsSep " " (u: u + ".service") roleUnitNames)}
-    excludePatterns=${lib.escapeShellArgs (map (e: "--exclude '" + e + "'") cfg.download.exclude)}
+    excludeArgs=( ${lib.escapeShellArgs cfg.download.exclude} )
+    excludeFlags=()
+    for _p in "''${excludeArgs[@]}"; do excludeFlags+=( --exclude "$_p" ); done
     exclusionsStr=${lib.concatStringsSep "|" cfg.download.exclude}
 
     mkdir -p "$versionsDir"
@@ -151,12 +153,12 @@ let
     done
 
     markerFile="$targetDir/.halogen-weights-complete"
-    expectedMarker="rev=${revision}|excl=${exclusionsStr}"
+    expectedMarker="rev=$revision|excl=$exclusionsStr"
     if [ -d "$targetDir" ]; then
       if [ -f "$markerFile" ]; then
         read -r firstLine < "$markerFile"
         if [ "$firstLine" = "$expectedMarker" ]; then
-          exclusionsDisplay="none"; [ -n "$exclusionsStr" ] && exclusionsDisplay="$exclusionsStr"; echo "halogen-weights: $targetDir complete (rev=${revision}, excl=$exclusionsDisplay), nothing to do"
+          echo "halogen-weights: $targetDir complete (rev=$revision, excl=$exclusionsStr), nothing to do"
           exit 0
         else
           echo "halogen-weights: $targetDir exists but exclusions/revision changed; will fetch (resumes from existing files)"
@@ -166,14 +168,14 @@ let
         # rather than re-fetching a complete tree. A missing file in the tree
         # is handled by hf download (re-verifies); only exclusions that were
         # previously absent can be added now without deleting anything.
-        echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=${revision})"
+        echo "halogen-weights: $targetDir present without marker; adopting as complete (rev=$revision)"
         echo "$expectedMarker" > "$markerFile"
         exit 0
       fi
     fi
 
     echo "halogen-weights: fetching $repo @ $revision into $targetDir"
-    "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" $excludePatterns
+    "$hf" download "$repo" --revision "$revision" --local-dir "$targetDir" "''${excludeFlags[@]}"
 
     # Write the completion marker immediately after the fetch succeeds,
     # before the symlink flip. This means a failed/superseded fetch (e.g.
