@@ -33,6 +33,13 @@
 #   weights_changed  "true" if defaultWeightsRevision needs patching
 #   changed          "true" if either does (module.nix was patched)
 #   reason           "bump" | "tag-moved" | "none" (image-side only)
+#   exclude_changed  "true" if the download.exclude default was re-patched
+#   download_gib     projected download (GiB) with the final exclude list
+#   excluded_gib     projected skipped size (GiB)
+#   exclude_added    count of brand-new large files auto-excluded
+#   exclude_dropped  count of stale patterns removed
+#   exclude_over_budget "true" if projected download exceeds the budget
+#   exclude_review   "true" if a human must confirm the exclude changes
 #   branch           branch name to commit the patch to
 #   pr_title         commit message / PR title
 #
@@ -40,6 +47,10 @@
 #   IMAGE, UPSTREAM_REPO, WEIGHTS_REPO, MODULE, BODY_FILE, TARGET
 #   TARGET  pin to a specific tag instead of the newest on GHCR (used by
 #           `workflow_dispatch`); must exist in the registry's tag list.
+#   EXCLUDE_MIN_GIB      min size (GiB) for a brand-new file to be auto-excluded
+#                        on a weights bump (default 2)
+#   DOWNLOAD_BUDGET_GIB  projected-download budget (GiB) above which the PR is
+#                        flagged for review (default 200)
 set -euo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/peonist-ai/halogen-flash-server}"
@@ -310,6 +321,173 @@ else
   out pr_title "bump: halogen weights -> ${short_weights}"
 fi
 
+# --- 7b. re-derive download exclusions on a weights bump --------------------
+# The exclude list is a curated denylist of large unused checkpoints; it must
+# be revisited whenever the weights revision moves, or a bump silently pulls
+# the whole repo (286 GiB) and overflows the volume. This automates that hop:
+# it projects the download against the new tree, drops patterns that match
+# nothing, and auto-excludes brand-new large files. It never auto-excludes a
+# file already downloaded at the previous revision (v2/ngram are huge but
+# needed) -- only files absent from the old tree, which a human confirms the
+# engine does not need before merging. Runs only when the revision moved: on an
+# image-only bump the tree is unchanged and re-patching would open a no-op PR.
+exclude_changed="false"
+exclude_report=""
+if [ "${weights_changed}" = "true" ] && [ -n "${new_weights}" ]; then
+  EXCLUDE_MIN_GIB="${EXCLUDE_MIN_GIB:-2}"
+  DOWNLOAD_BUDGET_GIB="${DOWNLOAD_BUDGET_GIB:-200}"
+  old_tree="$(mktemp)"; new_tree="$(mktemp)"; excl_report="$(mktemp)"; excl_vars="$(mktemp)"
+  curl -fsSL --retry 2 "https://huggingface.co/api/models/${WEIGHTS_REPO}/tree/${cur_weights}?recursive=true" -o "${old_tree}" 2>/dev/null || true
+  curl -fsSL --retry 2 "https://huggingface.co/api/models/${WEIGHTS_REPO}/tree/${new_weights}?recursive=true" -o "${new_tree}" 2>/dev/null || true
+
+  if python3 - "${MODULE}" "${old_tree}" "${new_tree}" "${EXCLUDE_MIN_GIB}" "${DOWNLOAD_BUDGET_GIB}" "${excl_report}" > "${excl_vars}" 2>"${excl_vars}.err" <<'PY'
+import json, re, sys, fnmatch
+
+# argv: module old_tree new_tree min_gib budget report_path
+module_path, old_tree_p, new_tree_p, min_gib, budget, report_p = sys.argv[1:7]
+min_gib = float(min_gib); budget = float(budget)
+GIB = 1024 ** 3
+
+
+def load(p):
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    out = []
+    for e in data:
+        if e.get("type") != "file":
+            continue
+        size = (e.get("lfs") or {}).get("size") or e.get("size") or 0
+        out.append((e.get("path", ""), int(size)))
+    return out
+
+
+def matched(path, pats):
+    return any(fnmatch.fnmatch(path, p) for p in pats)
+
+
+def gib(s):
+    return f"{s / GIB:.1f} GiB"
+
+
+new_files = load(new_tree_p)
+old_files = load(old_tree_p)
+
+with open(module_path, encoding="utf-8") as fh:
+    text = fh.read()
+m = re.search(r'options\.exclude\s*=\s*lib\.mkOption\s*\{.*?default\s*=\s*\[(.*?)\];', text, re.S)
+cur_patterns = re.findall(r'"([^"]*)"', m.group(1)) if m else []
+
+if new_files is None:
+    print("exclude_changed=false")
+    open(report_p, "w").write("")
+    sys.exit(0)
+
+# stale: current patterns matching nothing in the new tree
+stale = [p for p in cur_patterns if not any(fnmatch.fnmatch(fp, p) for fp, _ in new_files)]
+
+# previously-downloaded names: old tree minus current excludes. If the old tree
+# is unavailable, treat every new file as known so nothing is auto-added.
+if old_files is not None:
+    old_all = {p for p, _ in old_files}
+else:
+    old_all = {p for p, _ in new_files}
+
+min_bytes = min_gib * GIB
+added = [p for p, s in new_files
+         if not matched(p, cur_patterns) and s >= min_bytes and p not in old_all]
+
+kept = [p for p in cur_patterns if p not in stale]
+final = kept + sorted(set(added))
+exclude_changed = "true" if sorted(final) != sorted(cur_patterns) else "false"
+
+dl = [(p, s) for p, s in new_files if not matched(p, final)]
+ex = [(p, s) for p, s in new_files if matched(p, final)]
+dl_gib = sum(s for _, s in dl) / GIB
+ex_gib = sum(s for _, s in ex) / GIB
+over = dl_gib > budget
+review = "true" if (added or over or stale) else "false"
+
+if exclude_changed == "true":
+    # Reuse the anchored regex (NOT a bare find("default")): the option's
+    # comment mentions "defaultRepo"/"set [ ]", which a naive find matches and
+    # then corrupts. This matches the real `default = [ ... ];` only.
+    m2 = re.search(r'(options\.exclude\s*=\s*lib\.mkOption\s*\{.*?default\s*=\s*)(\[.*?\];)', text, re.S)
+    if not m2:
+        sys.exit("could not locate options.exclude default to patch")
+    g1 = m2.group(1)
+    dpos = g1.rfind("default")
+    indent = g1[g1.rfind("\n", 0, dpos) + 1:dpos]
+    if final:
+        inner = "[\n" + "".join(f'{indent}  "{p}"\n' for p in final) + f"{indent}];"
+    else:
+        inner = "[ ];"
+    text = text[:m2.start(2)] + inner + text[m2.end(2):]
+    with open(module_path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+print(f"exclude_changed={exclude_changed}")
+print(f"download_gib={dl_gib:.1f}")
+print(f"excluded_gib={ex_gib:.1f}")
+print(f"exclude_added={len(added)}")
+print(f"exclude_dropped={len(stale)}")
+print(f"exclude_over_budget={'true' if over else 'false'}")
+print(f"exclude_review={review}")
+
+lines = ["### Download exclusions (re-derived for the new tree)", "",
+         f"Projected download with the final exclude list: **{dl_gib:.1f} GiB** "
+         f"(skipped {ex_gib:.1f} GiB). Budget {budget:.0f} GiB."]
+if over:
+    lines += ["", f"> **Over budget**: projected download {dl_gib:.1f} GiB exceeds "
+                  f"{budget:.0f} GiB. Largest non-excluded files are candidates to exclude."]
+lines += ["", f"- exclude list: `{', '.join(cur_patterns) or '(empty)'}` -> "
+              f"`{', '.join(final) or '(empty)'}`"]
+if added:
+    lines += ["", f"- **auto-excluded {len(added)} new large file(s)** (in the new tree, "
+                  f"absent from the previous one, >= {min_gib:g} GiB). Confirm the engine "
+                  f"does NOT need these before merging:"]
+    for p, s in sorted([(p, s) for p, s in new_files if p in added], key=lambda x: -x[1]):
+        lines.append(f"    - `{p}` ({gib(s)})")
+if stale:
+    lines += ["", f"- dropped stale pattern(s) matching nothing in the new tree: `{', '.join(stale)}`"]
+lines += ["", "<details><summary>per-file projection</summary>", "",
+          "| file | size | action |", "|---|---|---|"]
+for p, s in sorted(new_files, key=lambda x: -x[1]):
+    lines.append(f"| `{p}` | {gib(s)} | {'skip' if matched(p, final) else 'fetch'} |")
+lines += ["", "</details>"]
+open(report_p, "w").write("\n".join(lines) + "\n")
+PY
+  then
+    while IFS='=' read -r k v; do
+      case "${k}" in
+        exclude_changed) exclude_changed="${v}" ;;
+        download_gib) download_gib="${v}" ;;
+        excluded_gib) excluded_gib="${v}" ;;
+        exclude_added) exclude_added="${v}" ;;
+        exclude_dropped) exclude_dropped="${v}" ;;
+        exclude_over_budget) exclude_over_budget="${v}" ;;
+        exclude_review) exclude_review="${v}" ;;
+      esac
+    done < "${excl_vars}"
+    [ -s "${excl_report}" ] && exclude_report="$(cat "${excl_report}")"
+  else
+    echo "::warning::could not re-derive download exclusions: $(cat "${excl_vars}.err")" >&2
+  fi
+  rm -f "${old_tree}" "${new_tree}" "${excl_report}" "${excl_vars}" "${excl_vars}.err"
+
+  out exclude_changed "${exclude_changed}"
+  out download_gib "${download_gib:-}"
+  out excluded_gib "${excluded_gib:-}"
+  out exclude_added "${exclude_added:-0}"
+  out exclude_dropped "${exclude_dropped:-0}"
+  out exclude_over_budget "${exclude_over_budget:-false}"
+  out exclude_review "${exclude_review:-false}"
+fi
+
 # --- 8. PR body -------------------------------------------------------------
 {
   echo "## What moved"
@@ -363,6 +541,10 @@ fi
     echo "- [ ] New checkpoint is compatible with the pinned image"
     echo "      \`${IMAGE}:${new}\`"
     echo "- [ ] Target host's warmup window covers a full fetch"
+    if [ -n "${exclude_report}" ]; then
+      echo
+      printf '%s\n' "${exclude_report}"
+    fi
   fi
 
   if [ "${image_changed}" = "true" ]; then
