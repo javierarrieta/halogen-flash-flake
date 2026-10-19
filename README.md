@@ -58,8 +58,10 @@ Then `nixos-rebuild switch`. The **first start takes hours** (~118 GiB weight tr
 systemctl status halogen-flash            # or -engine / -api in split mode
 journalctl -u halogen-flash -f            # weight load takes minutes on first boot
 curl http://localhost:8731/health         # engine + api versions, feature list
-podman ps                                 # root run: container is `--rm`; gone after stop
+podman ps                                 # container is `--rm` + explicit stop cleanup; gone after stop
 ```
+
+Stopping is podman-mediated on purpose. Under rootless podman the container is not in the unit's cgroup (see the module header), so `systemctl stop` alone would kill the `podman run` client and leave the container running under conmon, holding ~29 GB of GTT while reporting `Up`. The role units therefore run `podman stop -t 30` on `ExecStop` and `podman rm -f --ignore` on `ExecStopPost`.
 
 With a non-root `user`, pull the image into their storage once (and after every image bump):
 
@@ -82,6 +84,7 @@ Failure signatures seen in the wild, all fixed in this module but useful to reco
 - `unknown flag: --name ...` (one merged argument) — systemd splits `ExecStart` itself, no shell; flag/value pairs must be separate argv elements.
 - `setting ulimit ... Operation not permitted` — raising the hard memlock limit needs `LimitMEMLOCK=infinity` on the unit (systemd applies limits as root before switching to `User=`).
 - `newuidmap: executable file not found in $PATH` — rootless runs with a subuid range need the setuid uid-mapping helpers on podman's lookup path.
+- `the container name "halogen-flash-all" is already in use` + `Falling back to --cgroup-manager=cgroupfs` — the unit was restarted and the previous container survived it, because it lives outside the unit's cgroup. Recovered by `--replace` on start and by the `ExecStop`/`ExecStopPost` cleanup; do not replace those with a larger `TimeoutStopSec`, which cannot reach that container either.
 
 Caveats:
 

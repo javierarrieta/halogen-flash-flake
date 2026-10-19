@@ -47,6 +47,32 @@
 # Disk is capped at TWO versions: the sync unit prunes every version dir that
 # is not the live one before it starts a fetch, so a revision bump never needs
 # room for three. That prune is unchanged and load-bearing.
+#
+# Lifecycle: stopping the unit is podman-mediated, NOT cgroup-mediated.
+# Under rootless podman (`user` != root, which is how llm01 runs) the unit has
+# no logind session, so podman logs "Falling back to --cgroup-manager=cgroupfs"
+# and the container's cgroup is not a descendant of the unit's. Measured on
+# 2026-10-19 when a deploy restarted the unit and the old container survived it:
+#   * KillMode=control-group reaches only the unit's own cgroup, so
+#     `systemctl stop` kills the `podman run` client and leaves the container
+#     running under conmon — holding ~29 GB of GTT, reporting `Up` to podman
+#     while `halogen:engine_up` is 0;
+#   * TimeoutStopSec cannot fix that: a longer stop timeout only delays the
+#     same KILL, which misses the container identically;
+#   * the survivor keeps the fixed --name, so every later start exits 125 (that
+#     part is recovered by --replace on ExecStart, which stays as the backstop).
+# So the unit stops and removes the container through podman itself, which
+# addresses it via podman's own state rather than through a cgroup it does not
+# own. Check 9 in tests/test-unit-invariance.sh pins ExecStop/ExecStopPost.
+#
+# Do NOT "fix" this by moving podman to the systemd cgroup manager or by adding
+# Delegate=. Rootless podman creates its scopes under
+# user.slice/user-<uid>.slice/user@<uid>.service/, which is not under
+# system.slice/halogen-flash.service either — enabling lingering changes where
+# the scope lives, not whether this system unit owns it, so KillMode still would
+# not reach the container. That is why the explicit stop directives are the
+# cause-level fix here and not a symptom patch; it is also what podman's own
+# quadlet unit generator emits for the same reason.
 {
   lib,
   pkgs,
@@ -514,6 +540,30 @@ let
       # own once the fetch lands.
       Restart = "on-failure";
       RestartSec = "30";
+      # Stop path — see the header note. The container is outside this unit's
+      # cgroup under rootless podman, so systemd's own kill cannot reach it and
+      # these podman-mediated directives are the only thing that does.
+      #
+      # Both are `-`-prefixed (ignore failure): a cleanup error must not fail the
+      # unit, or the comin health gate rolls back a deploy over a container that
+      # was already gone. Neither may be `+`-prefixed: rootless podman keeps its
+      # state in cfg.user's store, so a root-prefixed cleanup would clean root's
+      # store and leave the real container holding the GPU. systemd applies
+      # User= and Environment= to Exec*Post too, so HOME/XDG_RUNTIME_DIR are
+      # already the values rootless podman needs.
+      #
+      # ExecStop drains (in-flight requests finish, GTT unmaps cleanly; upstream
+      # documents --ignore for exactly this ExecStop-references-a-gone-container
+      # case). ExecStopPost is the backstop and, unlike ExecStop, also runs after
+      # a FAILED start — that is what reaps a half-created container. `--rm` on
+      # ExecStart already removes a container that exits by itself, so on the
+      # happy path the rm is a no-op.
+      ExecStop = "-${podmanPkg}/bin/podman stop -t 30 --ignore halogen-flash-${roleName}";
+      ExecStopPost = "-${podmanPkg}/bin/podman rm -f --ignore halogen-flash-${roleName}";
+      # Bounds ExecStop + ExecStopPost together. Explicit rather than inherited
+      # so the relationship to the `-t 30` drain above stays visible if anyone
+      # raises that timeout.
+      TimeoutStopSec = "60";
       # systemd splits ExecStart itself (no shell): flag/value pairs stay
       # separate argv elements, each through sysdArg so paths/env values with
       # spaces survive. (escapeShellArgs was wrong here: it quotes per element
