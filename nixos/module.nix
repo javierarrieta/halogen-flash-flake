@@ -452,9 +452,12 @@ let
     description = "halogen-flash-server (${roleName})";
     wantedBy = [ "multi-user.target" ];
     after =
-      # The pull unit is a hard dependency: no image, no server. It exits 0
-      # when the pinned artifact is already local, so this does not make
-      # boot contingent on the registry being reachable.
+      # The pull unit is a soft dependency: ordering only. A pull timeout
+      # (e.g. when the ~112 GiB weights fetch saturates disk IO) must NOT
+      # cascade into a role-unit failure, so this is After= (ordering) not
+      # Requires= (hard dependency). It exits 0 when the pinned artifact is
+      # already local, so this does not make boot contingent on the registry
+      # being reachable.
       (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ])
       # No edge on halogen-flash-weights.service: the fetch is a background
       # reconciler now, and ordering here would let a multi-hour download delay
@@ -465,8 +468,14 @@ let
       # split mode: don't race the engine to boot; its weight load takes
       # minutes and an API that starts first crash-loops until it is ready.
       ++ lib.optional (cfg.mode == "split" && roleName == "api") "halogen-flash-engine.service";
-    wants = lib.optionals (cfg.download.enable || cfg.pull.enable) [ "network-online.target" ];
-    requires = lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ];
+    wants =
+      (lib.optionals (cfg.download.enable || cfg.pull.enable) [ "network-online.target" ])
+      # The pull unit — Wants= (not Requires=): see the `after` comment above.
+      # If the pull unit is already done (success or failure) when this unit
+      # starts, systemd starts this unit anyway. If the image is missing, the
+      # podman ExecStart fails and Restart=on-failure retries until the pull
+      # completes and the image lands.
+      ++ (lib.optionals cfg.pull.enable [ "halogen-flash-pull.service" ]);
     serviceConfig = {
       User = cfg.user;
       # Keep hub tmp/locks next to weights: predictable, per-host, no HOME
@@ -585,9 +594,14 @@ in
         The unit retries three times, and still succeeds if the pull fails
         while the exact artifact is already in local storage, so a reboot
         during a registry outage keeps the server up. If the artifact is
-        neither pullable nor present, the unit fails and the role units do
-        not start (they `Requires=` it) — a loud failure the host health
-        gate sees, rather than a silently stale container.
+        neither pullable nor present, the unit fails and retries on a
+        bounded schedule (`Restart=on-failure`, 10 attempts in 10 minutes).
+        The role units order after it (`After=`) but do not `Requires=` it,
+        so a pull timeout — e.g. disk IO starved by a concurrent ~112 GiB
+        weights fetch — cannot stop a server that is already running. The
+        role units' own `Restart=on-failure` keeps retrying until the image
+        lands, which is a loud failure the host health gate sees rather than
+        a silently stale container.
 
         Only enable this with a digest-pinned `image`; the module warns
         otherwise.
@@ -879,6 +893,11 @@ in
       systemd.services."halogen-flash-pull" = {
         description = "Pull the halogen-flash-server image";
         wantedBy = [ "multi-user.target" ];
+        # Deliberately NO ordering edge on halogen-flash-weights.service: that
+        # unit can legitimately run for up to 2 days (~112 GiB fetch), and
+        # After= would hold the pull — and so, via the role units' After=, the
+        # server — behind the whole transfer. IO contention is handled by the
+        # pull's own retry (Restart=on-failure), not by serialising the two.
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         serviceConfig = {
@@ -897,6 +916,19 @@ in
           # here. Generous, but bounded well below the weight-fetch
           # timeout on the sync unit.
           TimeoutStartSec = "30min";
+          # Retry on failure so an IO-starved timeout (e.g. the weights
+          # fetch saturating disk) recovers instead of leaving the image
+          # permanently absent and the role units stuck retrying.
+          Restart = "on-failure";
+          RestartSec = "60";
+        };
+        # Bound the retry storm: a persistently unreachable registry or a
+        # digest that never resolves would otherwise restart every 60 s
+        # forever. Ten attempts in ten minutes rides out a transient blip
+        # without churning indefinitely.
+        unitConfig = {
+          StartLimitBurst = 10;
+          StartLimitIntervalSec = 600;
         };
       };
     })
