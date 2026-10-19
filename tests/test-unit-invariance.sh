@@ -119,6 +119,71 @@ for mode in all split; do
     fail "role units would fail to start if a previous container survived"
     printf '%s\n' "$A" | grep -E '^[a-z_]+_CFG_ExecStart=' || true
   fi
+
+  # 9. Stopping the unit must remove the container. Rootless podman here falls
+  #    back to --cgroup-manager=cgroupfs, so the container is NOT in this unit's
+  #    cgroup: KillMode=control-group cannot reach it and `systemctl stop` leaves
+  #    it running under conmon, holding ~29 GB of GTT and reporting `Up` while
+  #    the server is actually wedged (issue #38). The only directive that reaches
+  #    it is an explicit podman stop/rm, which talks to the container through
+  #    podman's own state instead of through the cgroup.
+  #
+  #    ExecStopPost specifically: it runs even when the start failed, so it also
+  #    reaps a half-created container, and it runs unconditionally on stop.
+  if [ "$mode" = split ]; then
+    role_units="halogen-flash-engine halogen-flash-api"
+  else
+    role_units="halogen-flash"
+  fi
+  for un in $role_units; do
+    pfx="$(printf '%s' "$un" | tr '-' '_')"
+    # The container name is derived from the role, not the unit name.
+    cname="halogen-flash-$( [ "$mode" = split ] && printf '%s' "${un#halogen-flash-}" || printf all )"
+
+    stop="$(printf '%s\n' "$A" | grep "^${pfx}_CFG_ExecStop=" || true)"
+    stpost="$(printf '%s\n' "$A" | grep "^${pfx}_CFG_ExecStopPost=" || true)"
+    # systemd's failure-ignore prefix is on the COMMAND, so test the value
+    # rather than the `key=` line the harness dumps.
+    stop_v="${stop#*=}"
+    stpost_v="${stpost#*=}"
+
+    case "$stop_v" in
+      +*) fail "$un: ExecStop is +-prefixed (root); rootless podman state is in the service user's store" ;;
+      -*) ;;
+      *) fail "$un: ExecStop must be --prefixed so a cleanup failure cannot fail the unit" ;;
+    esac
+    case "$stpost_v" in
+      +*) fail "$un: ExecStopPost is +-prefixed (root); rootless podman state is in the service user's store" ;;
+      -*) ;;
+      *) fail "$un: ExecStopPost must be --prefixed so a cleanup failure cannot fail the unit" ;;
+    esac
+
+    if printf '%s\n' "$stop" | grep -q 'podman stop' \
+       && printf '%s\n' "$stop" | grep -q -- "-t " \
+       && printf '%s\n' "$stop" | grep -q -- "$cname"; then
+      ok "$un: ExecStop stops $cname gracefully"
+    else
+      fail "$un: no graceful 'podman stop -t N $cname'"
+      printf '%s\n' "$stop" || true
+    fi
+
+    if printf '%s\n' "$stpost" | grep -q -- 'rm -f --ignore' \
+       && printf '%s\n' "$stpost" | grep -q -- "$cname"; then
+      ok "$un: ExecStopPost force-removes $cname"
+    else
+      fail "$un: no 'podman rm -f --ignore $cname' cleanup; a survivor leaks GTT (issue #38)"
+      printf '%s\n' "$stpost" || true
+    fi
+
+    # The stop phase covers ExecStop + ExecStopPost, so it needs an explicit
+    # ceiling above the `podman stop -t` drain or it inherits the manager
+    # default and the KILL lands before the drain finishes.
+    if printf '%s\n' "$A" | grep -q "^${pfx}_CFG_TimeoutStopSec="; then
+      ok "$un: TimeoutStopSec is explicit, sized above the stop drain"
+    else
+      fail "$un: TimeoutStopSec unset; stop inherits the manager default"
+    fi
+  done
 done
 
 exit "$status"
