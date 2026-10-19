@@ -323,6 +323,18 @@ let
       "--name"
       "halogen-flash-${roleName}"
       "--rm"
+      # Take over a container left by a previous run instead of failing to
+      # start. Without this the unit is permanently wedged by its own name:
+      # `podman run` exits 125 with "the container name ... is already in use"
+      # and Restart=on-failure loops on that forever.
+      #
+      # Not hypothetical. On 2026-10-19 a deploy restarted the unit; podman
+      # exited on the stop signal but the container kept running under conmon
+      # (rootless podman falls back to --cgroup-manager=cgroupfs, so the
+      # container is outside this unit's cgroup and KillMode cannot reach it).
+      # The survivor held the name, every subsequent start failed, and llm01
+      # was down ~19 min until the container was removed by hand.
+      "--replace"
       # Upstream contract — keep in sync with their docker-compose.yml. The
       # seccomp escape is load-bearing: ROCm's syscall surface (kfd ioctls,
       # large mappings) trips the default profile, and their README ships it

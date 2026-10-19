@@ -108,6 +108,17 @@ for mode in all split; do
   else
     fail "role units do not reference the constant current mount path"
   fi
+
+  # 8. `podman run` must be able to take over a container left by a crashed or
+  #    detached previous run. Without --replace the fixed `--name` makes every
+  #    start fail with "container name already in use" and the unit crash-loops
+  #    on it forever (llm01 was down ~19 min this way on 2026-10-19).
+  if printf '%s\n' "$A" | grep -E '^[a-z_]+_CFG_ExecStart=' | grep -q -- '--replace'; then
+    ok "role units pass --replace to podman run"
+  else
+    fail "role units would fail to start if a previous container survived"
+    printf '%s\n' "$A" | grep -E '^[a-z_]+_CFG_ExecStart=' || true
+  fi
 done
 
 exit "$status"
