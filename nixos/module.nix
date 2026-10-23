@@ -92,7 +92,7 @@ let
   # the Nix store, the lock freezes the text that names them. Bump deliberately:
   # a new revision makes the next sync fetch ~118 GiB. scripts/bump-image.sh
   # reports the upstream sha.
-  defaultWeightsRevision = "b8c71238e248c1d223832e0d1b0341e3348f0da9";
+  defaultWeightsRevision = "647e3814953e8435d58f5d5aa13b97aca85a7d93";
 
   # Rootless runs need the setuid newuidmap/newgidmap: plain pkgs.podman
   # bundles crun/passt/etc. next to its binary, but the uid-mapping helpers
@@ -621,7 +621,7 @@ in
 
     image = lib.mkOption {
       type = lib.types.str;
-      default = "ghcr.io/peonist-ai/halogen-flash-server:0.18.9@sha256:6e1e155f254f3eddab69096eb343eda75739ae865e886e7ae03fff871587da48";
+      default = "ghcr.io/peonist-ai/halogen-flash-server:0.18.14@sha256:e0c1d1b48e07c8acdd204fbdbafbb421a395a73cf704271845a1846ad1fd767f";
       description = ''
         Full container-image reference for the release build. Both units in
         split mode run this one reference on purpose: an API older than the
