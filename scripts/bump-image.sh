@@ -31,6 +31,9 @@
 #   hf_modified      upstream weights lastModified timestamp
 #   image_changed    "true" if the image reference needs patching
 #   weights_changed  "true" if defaultWeightsRevision needs patching
+#   weights_content  "same" | "different" | "unknown": did the bytes the engine
+#                        reads actually move between the two revisions
+#   weights_noop     "true" if the revision moved but no downloaded byte did
 #   changed          "true" if either does (module.nix was patched)
 #   reason           "bump" | "tag-moved" | "none" (image-side only)
 #   exclude_changed  "true" if the download.exclude default was re-patched
@@ -175,6 +178,87 @@ if [ -z "${new_weights}" ]; then
 fi
 out weights_probe "${weights_probe}"
 
+# --- 4b. did the weights commit move any byte the engine reads? -------------
+# A commit id is not a content hash. Upstream commits the weights repo with
+# huggingface_hub on its own schedule and most of those commits re-upload
+# README.md only: every .hgn and every tokenizer file is untouched and carries
+# the same sha256. Judging the pin on the commit id alone therefore opens a bump
+# PR for a change that downloads nothing new -- and taking such a commit is not
+# free. The module keys its version dir and its fetch-completion marker on the
+# commit id rather than the content, so a new id re-fetches the whole 112.1 GiB
+# set into a second tree (peak ~224 GiB on the volume) to end up with bytes the
+# running server already has, then restarts to load them.
+#
+# So the revision counts as moved only when the bytes that would actually be
+# fetched moved. "Fetched" means the files the engine reads -- *.hgn plus
+# tokenizer/ -- minus what download.exclude skips. Repo documentation
+# (README.md, halogen.jpg, .gitattributes) is left out of the fingerprint: the
+# container never reads it and the server never validates it.
+#
+# "unknown" is deliberately NOT treated as unchanged. If either tree cannot be
+# read the run falls back to the old behaviour and opens the PR: a missed real
+# weights bump is far worse than a spurious one.
+weights_content="unknown"
+if [ -n "${new_weights}" ] && [ "${new_weights}" != "${cur_weights}" ]; then
+  wt_old="$(mktemp)"; wt_new="$(mktemp)"
+  curl -fsSL --retry 2 "https://huggingface.co/api/models/${WEIGHTS_REPO}/tree/${cur_weights}?recursive=true" -o "${wt_old}" 2>/dev/null || true
+  curl -fsSL --retry 2 "https://huggingface.co/api/models/${WEIGHTS_REPO}/tree/${new_weights}?recursive=true" -o "${wt_new}" 2>/dev/null || true
+  weights_content="$(python3 - "${MODULE}" "${wt_old}" "${wt_new}" <<'PY' 2>/dev/null || true
+import json, re, sys, fnmatch, hashlib
+
+module_path, old_p, new_p = sys.argv[1:4]
+
+
+def load(p):
+    try:
+        with open(p) as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, list):
+        return None
+    out = {}
+    for e in data:
+        if e.get("type") != "file":
+            continue
+        path = e.get("path", "")
+        # Only what the engine reads. Repo docs are not part of what the pin
+        # means, so a docs-only commit must not move it.
+        if not (path.endswith(".hgn") or path.startswith("tokenizer/")):
+            continue
+        oid = (e.get("lfs") or {}).get("oid") or e.get("blobId") or ""
+        size = (e.get("lfs") or {}).get("size") or e.get("size") or 0
+        out[path] = f"{oid}:{size}"
+    return out
+
+
+with open(module_path, encoding="utf-8") as fh:
+    text = fh.read()
+m = re.search(r'options\.exclude\s*=\s*lib\.mkOption\s*\{.*?default\s*=\s*\[(.*?)\];', text, re.S)
+pats = re.findall(r'"([^"]*)"', m.group(1)) if m else []
+
+
+def fingerprint(files):
+    items = sorted(
+        f"{p}={v}"
+        for p, v in files.items()
+        if not any(fnmatch.fnmatch(p, pat) for pat in pats)
+    )
+    return hashlib.sha256("\n".join(items).encode()).hexdigest(), len(items)
+
+
+old, new = load(old_p), load(new_p)
+if old is None or new is None or not old or not new:
+    print("unknown")
+    sys.exit(0)
+print("same" if fingerprint(old)[0] == fingerprint(new)[0] else "different")
+PY
+)"
+  rm -f "${wt_old}" "${wt_new}"
+fi
+[ -n "${weights_content}" ] || weights_content="unknown"
+out weights_content "${weights_content}"
+
 # --- 5. what actually changed -----------------------------------------------
 # Each artifact is judged on its own, so a weights-only release still opens
 # a PR. An unreachable HuggingFace API is NOT counted as a change: we
@@ -186,12 +270,21 @@ if [ "${cur}" != "${new}" ] || { [ -n "${digest}" ] && [ "${cur_digest}" != "${d
 fi
 
 weights_changed="false"
+weights_noop="false"
 if [ -n "${new_weights}" ] && [ "${new_weights}" != "${cur_weights}" ]; then
-  weights_changed="true"
+  if [ "${weights_content}" = "same" ]; then
+    # The commit moved; nothing the engine loads did. Say so loudly in the log,
+    # because the alternative reading of "no PR opened" is "the bot is broken".
+    weights_noop="true"
+    echo "weights ${cur_weights} -> ${new_weights} moves no byte the engine reads (docs-only upstream commit); leaving the pin at ${cur_weights}."
+  else
+    weights_changed="true"
+  fi
 fi
 
 out image_changed "${image_changed}"
 out weights_changed "${weights_changed}"
+out weights_noop "${weights_noop}"
 
 if [ "${image_changed}" = "false" ] && [ "${weights_changed}" = "false" ]; then
   echo "already current: image ${cur}, weights ${cur_weights:-unpinned}."
@@ -522,6 +615,15 @@ fi
     echo "> **Weights probe failed**: the HuggingFace API was unreachable, so the"
     echo "> weights were NOT checked. This PR only covers the image. Re-run to"
     echo "> verify the weights revision."
+  fi
+  if [ "${weights_noop}" = "true" ]; then
+    echo
+    echo "> **Weights commit seen and deliberately not taken**: \`${WEIGHTS_REPO}\`"
+    echo "> moved to \`${new_weights}\`, but every \`.hgn\` and every tokenizer file"
+    echo "> carries the same sha256 as the pinned \`${cur_weights}\` -- the commit is"
+    echo "> documentation only. Patching the pin would re-fetch the full 112.1 GiB"
+    echo "> into a second version dir to end up with bytes the running server"
+    echo "> already has, so this PR covers the image alone."
   fi
 
   if [ "${weights_changed}" = "true" ]; then
