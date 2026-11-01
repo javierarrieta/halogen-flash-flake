@@ -239,7 +239,23 @@ jobs:
           # units). Gate on the markers that mean the unit is actually bad --
           # an unbalanced ExecStart quote produces exactly these, and a
           # green run with a broken unit is how the pull unit reached prod.
-          out="$(nix run nixpkgs#systemd -- verify verified-units/* 2>&1 || true)"
+          #
+          # `nix run nixpkgs#systemd` execs the package's default program --
+          # bin/systemd, not bin/systemd-analyze -- so the command that used to
+          # sit here ran nothing at all: it died with "unable to execute
+          # .../bin/systemd", the `|| true` swallowed that, and the grep below
+          # found no marker in the empty output. Every bump PR that reported
+          # this job green had verified zero unit files. Reproduced 2026-11-01
+          # and visible at the end of the step log of such a run.
+          #
+          # Probe the binary before trusting the output. Empty output is only
+          # clean if systemd-analyze actually launched, and the environmental
+          # noise above means a non-zero exit cannot tell the two apart.
+          if ! nix shell nixpkgs#systemd --command systemd-analyze --version >/dev/null 2>&1; then
+            echo "::error::systemd-analyze could not be executed; this step would verify nothing" >&2
+            exit 1
+          fi
+          out="$(nix shell nixpkgs#systemd --command systemd-analyze verify verified-units/* 2>&1 || true)"
           printf '%s\n' "$out"
           fatal="$(printf '%s\n' "$out" | grep -E 'Unbalanced quoting|bad unit file setting|fatal error' || true)"
           if [ -n "$fatal" ]; then
