@@ -621,7 +621,7 @@ in
 
     image = lib.mkOption {
       type = lib.types.str;
-      default = "ghcr.io/peonist-ai/halogen-flash-server:0.18.15@sha256:cde6ae91ab3497a470c848fd5c509b0f4af659a1dea7e74b8789df82cde0510e";
+      default = "ghcr.io/peonist-ai/halogen-flash-server:0.18.22@sha256:273714ccb64dabb7fac0418ee1b6dd83eb57d2fd44cf286eb68a7c694a27c203";
       description = ''
         Full container-image reference for the release build. Both units in
         split mode run this one reference on purpose: an API older than the
