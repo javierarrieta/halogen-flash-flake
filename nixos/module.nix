@@ -92,7 +92,19 @@ let
   # the Nix store, the lock freezes the text that names them. Bump deliberately:
   # a new revision makes the next sync fetch ~118 GiB. scripts/bump-image.sh
   # reports the upstream sha.
-  defaultWeightsRevision = "75c745de73b4a731b593ee74807e8d15f617be74";
+  #
+  # Deliberately left BEHIND upstream HEAD when a weights commit moves no
+  # bytes. Checked 2026-11-01 against upstream HEAD (1956973): the commits
+  # after this revision re-upload README.md only -- every .hgn and every
+  # tokenizer file carries the same LFS sha256 here as there, including
+  # chat_template.jinja, so the prompt cache is unaffected too. Taking such a
+  # commit is not free: the sync unit keys its version dir and its completion
+  # marker on the commit id rather than the content, so it re-fetches the full
+  # 112.1 GiB into a second tree (peak ~224 GiB on the volume) to end up with
+  # bytes the running server already has. scripts/bump-image.sh compares commit
+  # ids, so it keeps asking for these; re-check the tree's LFS oids before
+  # taking one.
+  defaultWeightsRevision = "e3dede45c734c3cab6ee7fbf3652475af64bcf02";
 
   # Rootless runs need the setuid newuidmap/newgidmap: plain pkgs.podman
   # bundles crun/passt/etc. next to its binary, but the uid-mapping helpers
